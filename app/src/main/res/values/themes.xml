@@ -1,0 +1,11 @@
+<resources>
+    <style name="Theme.MyPhysicalDeadZone" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#E84142</item>
+        <item name="colorPrimaryVariant">#B92E34</item>
+        <item name="colorSecondary">#58C7F3</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:navigationBarColor">#101216</item>
+        <item name="android:statusBarColor">#101216</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

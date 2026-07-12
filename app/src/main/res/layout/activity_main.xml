@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#101216"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="物理阻断条"
+            android:textColor="#F5F7FA"
+            android:textSize="26sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="编辑模式下可单指拖动、双指缩放旋转；关闭后只显示并触摸穿透。"
+            android:textColor="#AAB2C0"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btnService"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:layout_marginTop="18dp"
+            android:backgroundTint="#E84142"
+            android:text="显示阻断条"
+            android:textColor="#FFFFFF"
+            android:textSize="17sp"
+            android:textStyle="bold" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/switchEditable"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:layout_marginTop="12dp"
+            android:checked="true"
+            android:text="编辑模式：阻断条可拖动；关闭后触摸穿透"
+            android:textColor="#E6EAF0"
+            android:textSize="15sp"
+            app:thumbTint="#FFFFFF"
+            app:trackTint="#E84142" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="位置"
+            android:textColor="#F5F7FA"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:text="中心 X"
+                android:textColor="#CAD1DC"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/seekX"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="1440"
+                android:progress="540" />
+
+            <TextView
+                android:id="@+id/valueX"
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:text="中心 Y"
+                android:textColor="#CAD1DC"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/seekY"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="3200"
+                android:progress="960" />
+
+            <TextView
+                android:id="@+id/valueY"
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="形状"
+            android:textColor="#F5F7FA"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:text="宽度"
+                android:textColor="#CAD1DC"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/seekW"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="1400"
+                android:progress="360" />
+
+            <TextView
+                android:id="@+id/valueW"
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:text="高度"
+                android:textColor="#CAD1DC"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/seekH"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="900"
+                android:progress="78" />
+
+            <TextView
+                android:id="@+id/valueH"
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:text="旋转"
+                android:textColor="#CAD1DC"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/seekRotation"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="360"
+                android:progress="180" />
+
+            <TextView
+                android:id="@+id/valueRotation"
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:text="圆角"
+                android:textColor="#CAD1DC"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/seekCorner"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="240"
+                android:progress="18" />
+
+            <TextView
+                android:id="@+id/valueCorner"
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:text="透明度"
+                android:textColor="#CAD1DC"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/seekAlpha"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="210"
+                android:progress="130" />
+
+            <TextView
+                android:id="@+id/valueAlpha"
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+    </LinearLayout>
+</ScrollView>

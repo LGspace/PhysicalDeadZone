@@ -1,0 +1,31 @@
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+build/
+**/build/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+
+# Android packages and signing files
+*.apk
+*.aab
+*.ap_
+*.jks
+*.keystore
+
+# Native/IDA analysis artifacts
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.asm
+
+# Local analysis directories
+apk_analysis_old/
