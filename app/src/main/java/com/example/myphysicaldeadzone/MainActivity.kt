@@ -350,8 +350,12 @@ class MainActivity : AppCompatActivity() {
             }
         }, lp(-1, 220).apply { bottomMargin = dp(10) })
         content.addView(section("位置"))
-        seek("中心 X", 0, screenW, DeadZoneService.KEY_CENTER_X, screenW / 2)
-        seek("中心 Y", 0, screenH, DeadZoneService.KEY_CENTER_Y, screenH / 2)
+        val currentWidth = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH).coerceIn(40, 5000)
+        val currentHeight = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT).coerceIn(20, 5000)
+        val currentRotation = prefs.getInt(DeadZoneService.KEY_ROTATION, 0).coerceIn(-180, 180)
+        val centerLimits = currentCenterLimits(currentWidth, currentHeight, currentRotation)
+        seek("中心 X", centerLimits.minX, centerLimits.maxX, DeadZoneService.KEY_CENTER_X, screenW / 2)
+        seek("中心 Y", centerLimits.minY, centerLimits.maxY, DeadZoneService.KEY_CENTER_Y, screenH / 2)
         content.addView(section("形状"))
         seek("宽度", 40, screenW.coerceAtLeast(1400), DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH)
         seek("高度", 20, screenH.coerceAtLeast(900), DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT)
@@ -731,7 +735,7 @@ class MainActivity : AppCompatActivity() {
         var applyingProgrammatically = false
         lateinit var seekBar: SeekBar
         lateinit var valueInput: EditText
-        var pendingValue = clampParamValue(key, min, safeMax, prefs.getInt(key, fallback).coerceIn(min, safeMax))
+        var pendingValue = clampParamValue(min, safeMax, prefs.getInt(key, fallback))
 
         fun syncControls(value: Int) {
             applyingProgrammatically = true
@@ -750,7 +754,7 @@ class MainActivity : AppCompatActivity() {
             }
             val oldWidth = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH)
             val oldHeight = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT)
-            val value = clampParamValue(key, min, safeMax, rawValue)
+            val value = clampParamValue(min, safeMax, rawValue)
 
             if (key == DeadZoneService.KEY_WIDTH || key == DeadZoneService.KEY_HEIGHT) {
                 scaleLocalPointsForSize(
@@ -844,31 +848,19 @@ class MainActivity : AppCompatActivity() {
         if (!serviceRunning) writeConfig()
     }
 
-    private fun clampParamValue(key: String, min: Int, max: Int, value: Int): Int {
-        val clamped = value.coerceIn(min, max)
-        val width = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH).coerceAtLeast(1)
-        val height = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT).coerceAtLeast(1)
-        return when (key) {
-            DeadZoneService.KEY_CENTER_X -> clampCenter(clamped, width / 2, screenW)
-            DeadZoneService.KEY_CENTER_Y -> clampCenter(clamped, height / 2, screenH)
-            else -> clamped
-        }
-    }
-
-    private fun clampCenter(value: Int, margin: Int, screenSize: Int): Int {
-        val safeScreen = screenSize.coerceAtLeast(1)
-        val safeMargin = margin.coerceAtLeast(0)
-        if (safeMargin * 2 >= safeScreen) return safeScreen / 2
-        return value.coerceIn(safeMargin, safeScreen - safeMargin)
+    private fun clampParamValue(min: Int, max: Int, value: Int): Int {
+        return value.coerceIn(min, max)
     }
 
     private fun clampSavedCenterInsideScreen() {
         val width = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH).coerceAtLeast(1)
         val height = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT).coerceAtLeast(1)
+        val rotation = prefs.getInt(DeadZoneService.KEY_ROTATION, 0).coerceIn(-180, 180)
+        val limits = currentCenterLimits(width, height, rotation)
         val centerX = prefs.getInt(DeadZoneService.KEY_CENTER_X, screenW / 2)
         val centerY = prefs.getInt(DeadZoneService.KEY_CENTER_Y, screenH / 2)
-        val clampedX = clampCenter(centerX, width / 2, screenW)
-        val clampedY = clampCenter(centerY, height / 2, screenH)
+        val clampedX = limits.clampX(centerX)
+        val clampedY = limits.clampY(centerY)
         if (clampedX != centerX || clampedY != centerY) {
             prefs.edit()
                 .putInt(DeadZoneService.KEY_CENTER_X, clampedX)
@@ -888,8 +880,10 @@ class MainActivity : AppCompatActivity() {
         if (lastW == screenW && lastH == screenH) return
         val width = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH).coerceIn(40, 5000)
         val height = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT).coerceIn(20, 5000)
-        val centerX = clampCenter((prefs.getFloat(DeadZoneService.KEY_CENTER_X_PCT, 0.5f) * screenW).roundToInt(), width / 2, screenW)
-        val centerY = clampCenter((prefs.getFloat(DeadZoneService.KEY_CENTER_Y_PCT, 0.5f) * screenH).roundToInt(), height / 2, screenH)
+        val rotation = prefs.getInt(DeadZoneService.KEY_ROTATION, 0).coerceIn(-180, 180)
+        val limits = currentCenterLimits(width, height, rotation)
+        val centerX = limits.clampX((prefs.getFloat(DeadZoneService.KEY_CENTER_X_PCT, 0.5f) * screenW).roundToInt())
+        val centerY = limits.clampY((prefs.getFloat(DeadZoneService.KEY_CENTER_Y_PCT, 0.5f) * screenH).roundToInt())
         prefs.edit()
             .putInt(DeadZoneService.KEY_CENTER_X, centerX)
             .putInt(DeadZoneService.KEY_CENTER_Y, centerY)
@@ -904,11 +898,21 @@ class MainActivity : AppCompatActivity() {
         val dw = screenW.coerceAtLeast(1).toFloat()
         val dh = screenH.coerceAtLeast(1).toFloat()
         prefs.edit()
-            .putFloat(DeadZoneService.KEY_CENTER_X_PCT, (prefs.getInt(DeadZoneService.KEY_CENTER_X, screenW / 2) / dw).coerceIn(0f, 1f))
-            .putFloat(DeadZoneService.KEY_CENTER_Y_PCT, (prefs.getInt(DeadZoneService.KEY_CENTER_Y, screenH / 2) / dh).coerceIn(0f, 1f))
+            .putFloat(DeadZoneService.KEY_CENTER_X_PCT, prefs.getInt(DeadZoneService.KEY_CENTER_X, screenW / 2) / dw)
+            .putFloat(DeadZoneService.KEY_CENTER_Y_PCT, prefs.getInt(DeadZoneService.KEY_CENTER_Y, screenH / 2) / dh)
             .putInt(DeadZoneService.KEY_LAST_DISPLAY_W, screenW)
             .putInt(DeadZoneService.KEY_LAST_DISPLAY_H, screenH)
             .apply()
+    }
+
+    private fun currentCenterLimits(width: Int, height: Int, rotation: Int): DeadZoneGeometry.CenterLimits {
+        return DeadZoneGeometry.centerLimits(
+            loadLocalPoints(width, height),
+            rotation,
+            screenW,
+            screenH,
+            dp(32)
+        )
     }
 
     private fun applyOverlayThrottled(force: Boolean = false) {

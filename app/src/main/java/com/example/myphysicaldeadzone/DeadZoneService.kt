@@ -74,6 +74,7 @@ class DeadZoneService : Service() {
     companion object {
         private const val CHANNEL_ID = "dead_zone_overlay"
         private const val NOTIFICATION_ID = 7
+        private const val MINIMUM_VISIBLE_DP = 32
 
         const val PREFS = "DeadZoneConfig"
         const val KEY_CENTER_X = "CENTER_X"
@@ -142,7 +143,8 @@ class DeadZoneService : Service() {
             format = PixelFormat.TRANSLUCENT
             gravity = Gravity.TOP or Gravity.LEFT
             flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
@@ -304,16 +306,26 @@ class DeadZoneService : Service() {
         val bounds = polygonBounds(points, safeRotation)
         val displayWidth = currentDisplayWidth().coerceAtLeast(1)
         val displayHeight = currentDisplayHeight().coerceAtLeast(1)
+        val centerLimits = DeadZoneGeometry.centerLimits(
+            points,
+            safeRotation,
+            displayWidth,
+            displayHeight,
+            dp(MINIMUM_VISIBLE_DP)
+        )
+        val safeCenterX = centerLimits.clampX(centerX)
+        val safeCenterY = centerLimits.clampY(centerY)
         params.width = bounds.first.coerceIn(1, displayWidth)
         params.height = bounds.second.coerceIn(1, displayHeight)
-        params.x = layoutPositionFromScreenCenter(centerX, params.width, displayWidth, windowOffsetX)
-        params.y = layoutPositionFromScreenCenter(centerY, params.height, displayHeight, windowOffsetY)
+        params.x = safeCenterX - windowOffsetX - params.width / 2
+        params.y = safeCenterY - windowOffsetY - params.height / 2
         params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
             (if (editable) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
 
-        val actualCenterX = params.x + windowOffsetX + params.width / 2
-        val actualCenterY = params.y + windowOffsetY + params.height / 2
+        val actualCenterX = safeCenterX
+        val actualCenterY = safeCenterY
         if (persist) {
             prefs.edit()
                 .putInt(KEY_CENTER_X, actualCenterX)
@@ -374,13 +386,6 @@ class DeadZoneService : Service() {
         }
     }
 
-    private fun layoutPositionFromScreenCenter(center: Int, size: Int, displaySize: Int, offset: Int): Int {
-        val min = -offset
-        val max = displaySize - offset - size
-        val desired = center - offset - size / 2
-        return if (max < min) min else desired.coerceIn(min, max)
-    }
-
     private fun restorePixelsFromNormalizedPrefsIfNeeded() {
         val displayWidth = currentDisplayWidth().coerceAtLeast(1)
         val displayHeight = currentDisplayHeight().coerceAtLeast(1)
@@ -401,9 +406,17 @@ class DeadZoneService : Service() {
         val height = prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT).coerceIn(20, 5000)
         val centerX = (prefs.getFloat(KEY_CENTER_X_PCT, 0.5f) * displayWidth).roundToInt()
         val centerY = (prefs.getFloat(KEY_CENTER_Y_PCT, 0.5f) * displayHeight).roundToInt()
+        val points = loadLocalPoints(width, height)
+        val limits = DeadZoneGeometry.centerLimits(
+            points,
+            prefs.getInt(KEY_ROTATION, 0).coerceIn(-180, 180),
+            displayWidth,
+            displayHeight,
+            dp(MINIMUM_VISIBLE_DP)
+        )
         prefs.edit()
-            .putInt(KEY_CENTER_X, clampCenter(centerX, width / 2, displayWidth))
-            .putInt(KEY_CENTER_Y, clampCenter(centerY, height / 2, displayHeight))
+            .putInt(KEY_CENTER_X, limits.clampX(centerX))
+            .putInt(KEY_CENTER_Y, limits.clampY(centerY))
             .putInt(KEY_WIDTH, width)
             .putInt(KEY_HEIGHT, height)
             .putInt(KEY_LAST_DISPLAY_W, displayWidth)
@@ -415,18 +428,11 @@ class DeadZoneService : Service() {
         val dw = displayWidth.coerceAtLeast(1).toFloat()
         val dh = displayHeight.coerceAtLeast(1).toFloat()
         prefs.edit()
-            .putFloat(KEY_CENTER_X_PCT, (centerX / dw).coerceIn(0f, 1f))
-            .putFloat(KEY_CENTER_Y_PCT, (centerY / dh).coerceIn(0f, 1f))
+            .putFloat(KEY_CENTER_X_PCT, centerX / dw)
+            .putFloat(KEY_CENTER_Y_PCT, centerY / dh)
             .putInt(KEY_LAST_DISPLAY_W, displayWidth)
             .putInt(KEY_LAST_DISPLAY_H, displayHeight)
             .apply()
-    }
-
-    private fun clampCenter(value: Int, margin: Int, displaySize: Int): Int {
-        val safeSize = displaySize.coerceAtLeast(1)
-        val safeMargin = margin.coerceAtLeast(0)
-        if (safeMargin * 2 >= safeSize) return safeSize / 2
-        return value.coerceIn(safeMargin, safeSize - safeMargin)
     }
 
     fun refreshDaemonConfigFromActualView() {
@@ -488,6 +494,17 @@ class DeadZoneService : Service() {
     private fun showControlPanel() {
         if (controlPanelView != null) return
 
+        val currentWidth = prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH).coerceIn(40, 5000)
+        val currentHeight = prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT).coerceIn(20, 5000)
+        val currentRotation = prefs.getInt(KEY_ROTATION, 0).coerceIn(-180, 180)
+        val centerLimits = DeadZoneGeometry.centerLimits(
+            loadLocalPoints(currentWidth, currentHeight),
+            currentRotation,
+            currentDisplayWidth(),
+            currentDisplayHeight(),
+            dp(MINIMUM_VISIBLE_DP)
+        )
+
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(14))
@@ -518,10 +535,10 @@ class DeadZoneService : Service() {
         }, LinearLayout.LayoutParams(dp(76), dp(42)))
         panel.addView(titleRow)
 
-        addPanelSeekRow(panel, "X", 0, currentDisplayWidth(), prefs.getInt(KEY_CENTER_X, DEFAULT_CENTER_X)) {
+        addPanelSeekRow(panel, "X", centerLimits.minX, centerLimits.maxX, prefs.getInt(KEY_CENTER_X, DEFAULT_CENTER_X)) {
             updateFromPanel(centerX = it)
         }
-        addPanelSeekRow(panel, "Y", 0, currentDisplayHeight(), prefs.getInt(KEY_CENTER_Y, DEFAULT_CENTER_Y)) {
+        addPanelSeekRow(panel, "Y", centerLimits.minY, centerLimits.maxY, prefs.getInt(KEY_CENTER_Y, DEFAULT_CENTER_Y)) {
             updateFromPanel(centerY = it)
         }
         addPanelSeekRow(panel, "宽度", 40, currentDisplayWidth().coerceAtLeast(1400), prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH)) {
