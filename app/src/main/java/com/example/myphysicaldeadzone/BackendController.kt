@@ -32,7 +32,7 @@ class BackendController(private val context: Context) {
         const val LAUNCH_LOG_PATH = "/data/local/tmp/deadzone_launch.log"
         const val STATE_PATH = "/data/local/tmp/deadzone_state.json"
         const val COMMAND_NAME = "deadzone_command.json"
-        const val REQUIRED_BACKEND_VERSION = "deadzone_daemon file-control-v4"
+        const val REQUIRED_BACKEND_VERSION = "deadzone_daemon file-control-v5"
         private const val ASSET_PATH = "backend/arm64-v8a/deadzone_daemon"
     }
 
@@ -219,7 +219,7 @@ class BackendController(private val context: Context) {
         prefs.edit().putString(KEY_SCREEN, screen).apply()
 
         val rotateArg = "--rotate ${currentDisplayRotation()}"
-        val modeArgs = if (debugLog) "--verbose --log-state" else "--emit --grab"
+        val modeArgs = if (debugLog) "--emit --grab --verbose --log-state" else "--emit --grab"
         val commandPath = commandPath()
         val daemonCommand = "$TARGET_PATH --device ${quote(device)} --config ${quote(configPath)} " +
             "--screen ${quote(screen)} --state $STATE_PATH --command ${quote(commandPath)} $rotateArg $modeArgs"

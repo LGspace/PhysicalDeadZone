@@ -24,20 +24,29 @@
 namespace {
 
 constexpr int kMaxSlots = 16;
+constexpr int kMaxDeadZones = 8;
 constexpr int kDefaultScreenW = 1080;
 constexpr int kDefaultScreenH = 2400;
 constexpr const char* kDefaultStatePath = "/data/local/tmp/deadzone_state.json";
 constexpr const char* kVirtualDeviceName = "DeadZone Virtual Touchscreen";
-constexpr const char* kBackendVersion = "deadzone_daemon file-control-v4";
+constexpr const char* kBackendVersion = "deadzone_daemon file-control-v5";
 constexpr int kPendingEnableTimeoutMs = 5000;
 
 volatile sig_atomic_t g_running = 1;
 bool g_uinputWriteFailed = false;
 int g_uinputWriteErrno = 0;
 
+struct RectZone {
+    bool enabled = true;
+    float centerX = 540.0f;
+    float centerY = 960.0f;
+    float width = 360.0f;
+    float height = 78.0f;
+    float rotation = 0.0f;
+};
+
 struct RectConfig {
     bool enabled = true;
-    bool hasQuad = false;
     float displayWidth = kDefaultScreenW;
     float displayHeight = kDefaultScreenH;
     float centerX = 540.0f;
@@ -45,7 +54,8 @@ struct RectConfig {
     float width = 360.0f;
     float height = 78.0f;
     float rotation = 0.0f;
-    std::array<float, 8> quad {};
+    int zoneCount = 1;
+    std::array<RectZone, kMaxDeadZones> zones {};
 };
 
 struct AbsRange {
@@ -302,18 +312,18 @@ bool validateConfig(const RectConfig& rect, std::string* reason) {
         *reason = "invalid display size";
         return false;
     }
-    if (rect.hasQuad) {
-        for (float value : rect.quad) {
-            if (!std::isfinite(value)) {
-                *reason = "invalid quad point";
-                return false;
-            }
-        }
-        return true;
-    }
-    if (rect.width <= 0.0f || rect.height <= 0.0f) {
-        *reason = "invalid deadzone size";
+    if (rect.zoneCount < 0 || rect.zoneCount > kMaxDeadZones) {
+        *reason = "invalid deadzone count";
         return false;
+    }
+    for (int i = 0; i < rect.zoneCount; ++i) {
+        const RectZone& zone = rect.zones[i];
+        if (!std::isfinite(zone.centerX) || !std::isfinite(zone.centerY) ||
+            !std::isfinite(zone.width) || !std::isfinite(zone.height) ||
+            !std::isfinite(zone.rotation) || zone.width <= 0.0f || zone.height <= 0.0f) {
+            *reason = "invalid deadzone rectangle";
+            return false;
+        }
     }
     return true;
 }
@@ -342,17 +352,39 @@ float parseFloatField(const std::string& json, const char* key, float fallback) 
     return end == json.c_str() + p + 1 ? fallback : value;
 }
 
-bool tryParseFloatField(const std::string& json, const char* key, float* out) {
-    std::string needle = std::string("\"") + key + "\"";
-    size_t p = json.find(needle);
-    if (p == std::string::npos) return false;
-    p = json.find(':', p);
-    if (p == std::string::npos) return false;
-    char* end = nullptr;
-    float value = strtof(json.c_str() + p + 1, &end);
-    if (end == json.c_str() + p + 1) return false;
-    *out = value;
-    return true;
+void loadRectZonesFromJson(const std::string& json, RectConfig* config) {
+    const float requestedCount = parseFloatField(json, "zoneCount", -1.0f);
+    if (requestedCount < 0.0f) {
+        config->zoneCount = 1;
+        config->zones[0] = RectZone {
+            true,
+            config->centerX,
+            config->centerY,
+            config->width,
+            config->height,
+            config->rotation
+        };
+        return;
+    }
+
+    config->zoneCount = std::clamp(static_cast<int>(lroundf(requestedCount)), 0, kMaxDeadZones);
+    for (int i = 0; i < config->zoneCount; ++i) {
+        char key[48];
+        RectZone zone {};
+        snprintf(key, sizeof(key), "z%dEnabled", i);
+        zone.enabled = parseBoolField(json, key, true);
+        snprintf(key, sizeof(key), "z%dCenterX", i);
+        zone.centerX = parseFloatField(json, key, config->centerX);
+        snprintf(key, sizeof(key), "z%dCenterY", i);
+        zone.centerY = parseFloatField(json, key, config->centerY);
+        snprintf(key, sizeof(key), "z%dWidth", i);
+        zone.width = parseFloatField(json, key, config->width);
+        snprintf(key, sizeof(key), "z%dHeight", i);
+        zone.height = parseFloatField(json, key, config->height);
+        snprintf(key, sizeof(key), "z%dRotation", i);
+        zone.rotation = parseFloatField(json, key, config->rotation);
+        config->zones[i] = zone;
+    }
 }
 
 long long fileVersion(const struct stat& st) {
@@ -378,23 +410,13 @@ bool loadConfigIfChanged(const std::string& path, RectConfig* config, long long*
     config->width = parseFloatField(json, "width", config->width);
     config->height = parseFloatField(json, "height", config->height);
     config->rotation = parseFloatField(json, "rotation", config->rotation);
-    const char* keys[] = {"p0x", "p0y", "p1x", "p1y", "p2x", "p2y", "p3x", "p3y"};
-    std::array<float, 8> quad {};
-    bool hasQuad = true;
-    for (int i = 0; i < 8; ++i) {
-        if (!tryParseFloatField(json, keys[i], &quad[i])) {
-            hasQuad = false;
-            break;
-        }
-    }
-    config->hasQuad = hasQuad;
-    if (hasQuad) config->quad = quad;
+    loadRectZonesFromJson(json, config);
     *lastVersion = version;
 
     if (logConfig) {
-        fprintf(stderr, "config: display=(%.0f,%.0f) center=(%.1f,%.1f) size=(%.1f,%.1f) rot=%.1f quad=%d enabled=%d\n",
+        fprintf(stderr, "config: display=(%.0f,%.0f) center=(%.1f,%.1f) size=(%.1f,%.1f) rot=%.1f zones=%d enabled=%d\n",
                 config->displayWidth, config->displayHeight, config->centerX, config->centerY, config->width, config->height,
-                config->rotation, config->hasQuad ? 1 : 0, config->enabled ? 1 : 0);
+                config->rotation, config->zoneCount, config->enabled ? 1 : 0);
         fflush(stderr);
     }
     return true;
@@ -409,17 +431,7 @@ void loadConfigFromJson(const std::string& json, RectConfig* config) {
     config->width = parseFloatField(json, "width", config->width);
     config->height = parseFloatField(json, "height", config->height);
     config->rotation = parseFloatField(json, "rotation", config->rotation);
-    const char* keys[] = {"p0x", "p0y", "p1x", "p1y", "p2x", "p2y", "p3x", "p3y"};
-    std::array<float, 8> quad {};
-    bool hasQuad = true;
-    for (int i = 0; i < 8; ++i) {
-        if (!tryParseFloatField(json, keys[i], &quad[i])) {
-            hasQuad = false;
-            break;
-        }
-    }
-    config->hasQuad = hasQuad;
-    if (hasQuad) config->quad = quad;
+    loadRectZonesFromJson(json, config);
 }
 
 std::string parseStringField(const std::string& json, const char* key) {
@@ -460,12 +472,12 @@ const char* runtimeState(bool enabled) {
 std::string configSummary(const RectConfig& rect) {
     char buffer[512];
     snprintf(buffer, sizeof(buffer),
-             "display=%.0fx%.0f center=(%.1f,%.1f) size=(%.1f,%.1f) rotation=%.1f quad=%d",
+             "display=%.0fx%.0f center=(%.1f,%.1f) size=(%.1f,%.1f) rotation=%.1f zones=%d",
              rect.displayWidth, rect.displayHeight,
              rect.centerX, rect.centerY,
              rect.width, rect.height,
              rect.rotation,
-             rect.hasQuad ? 1 : 0);
+             rect.zoneCount);
     return std::string(buffer);
 }
 
@@ -682,98 +694,43 @@ void mapTouchToScreen(const SlotState& slot, const AbsRange& xRange, const AbsRa
     *outY = y;
 }
 
-void unrotatePoint(float x, float y, const RectConfig& rect, float* outX, float* outY) {
-    const float radians = -rect.rotation * static_cast<float>(M_PI) / 180.0f;
-    const float dx = x - rect.centerX;
-    const float dy = y - rect.centerY;
+void unrotatePointForZone(float x, float y, const RectZone& zone, float* outX, float* outY) {
+    const float radians = -zone.rotation * static_cast<float>(M_PI) / 180.0f;
+    const float dx = x - zone.centerX;
+    const float dy = y - zone.centerY;
     *outX = dx * cosf(radians) - dy * sinf(radians);
     *outY = dx * sinf(radians) + dy * cosf(radians);
 }
 
-bool pointInsideRect(float x, float y, const RectConfig& rect) {
+bool pointInsideZone(float x, float y, const RectZone& zone) {
+    if (!zone.enabled) return false;
     float localX = 0.0f;
     float localY = 0.0f;
-    unrotatePoint(x, y, rect, &localX, &localY);
-    return fabsf(localX) <= rect.width * 0.5f && fabsf(localY) <= rect.height * 0.5f;
-}
-
-float cross(float ax, float ay, float bx, float by, float cx, float cy) {
-    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-}
-
-bool rangesOverlap(float a0, float a1, float b0, float b1) {
-    if (a0 > a1) std::swap(a0, a1);
-    if (b0 > b1) std::swap(b0, b1);
-    return std::max(a0, b0) <= std::min(a1, b1) + 0.0001f;
-}
-
-bool pointInsideQuad(float x, float y, const RectConfig& rect) {
-    bool inside = false;
-    for (int i = 0; i < 4; ++i) {
-        const int j = (i + 3) % 4;
-        const float xi = rect.quad[i * 2];
-        const float yi = rect.quad[i * 2 + 1];
-        const float xj = rect.quad[j * 2];
-        const float yj = rect.quad[j * 2 + 1];
-        if (fabsf(cross(xi, yi, xj, yj, x, y)) <= 0.0001f &&
-            rangesOverlap(xi, xj, x, x) && rangesOverlap(yi, yj, y, y)) {
-            return true;
-        }
-        const bool intersects = ((yi > y) != (yj > y)) &&
-                                (x < (xj - xi) * (y - yi) / ((yj - yi) + 0.000001f) + xi);
-        if (intersects) inside = !inside;
-    }
-    return inside;
+    unrotatePointForZone(x, y, zone, &localX, &localY);
+    return fabsf(localX) <= zone.width * 0.5f && fabsf(localY) <= zone.height * 0.5f;
 }
 
 bool pointInsideDeadzoneShape(float x, float y, const RectConfig& rect) {
-    return rect.hasQuad ? pointInsideQuad(x, y, rect) : pointInsideRect(x, y, rect);
-}
-
-bool segmentsIntersect(float ax, float ay, float bx, float by,
-                       float cx, float cy, float dx, float dy) {
-    const float c1 = cross(ax, ay, bx, by, cx, cy);
-    const float c2 = cross(ax, ay, bx, by, dx, dy);
-    const float c3 = cross(cx, cy, dx, dy, ax, ay);
-    const float c4 = cross(cx, cy, dx, dy, bx, by);
-    if (((c1 > 0.0f && c2 < 0.0f) || (c1 < 0.0f && c2 > 0.0f)) &&
-        ((c3 > 0.0f && c4 < 0.0f) || (c3 < 0.0f && c4 > 0.0f))) {
-        return true;
-    }
-    if (fabsf(c1) <= 0.0001f && rangesOverlap(ax, bx, cx, cx) && rangesOverlap(ay, by, cy, cy)) return true;
-    if (fabsf(c2) <= 0.0001f && rangesOverlap(ax, bx, dx, dx) && rangesOverlap(ay, by, dy, dy)) return true;
-    if (fabsf(c3) <= 0.0001f && rangesOverlap(cx, dx, ax, ax) && rangesOverlap(cy, dy, ay, ay)) return true;
-    if (fabsf(c4) <= 0.0001f && rangesOverlap(cx, dx, bx, bx) && rangesOverlap(cy, dy, by, by)) return true;
-    return false;
-}
-
-bool segmentIntersectsQuad(float ax, float ay, float bx, float by, const RectConfig& rect) {
-    if (pointInsideQuad(ax, ay, rect) || pointInsideQuad(bx, by, rect)) return true;
-    for (int i = 0; i < 4; ++i) {
-        const int next = (i + 1) % 4;
-        if (segmentsIntersect(ax, ay, bx, by,
-                              rect.quad[i * 2], rect.quad[i * 2 + 1],
-                              rect.quad[next * 2], rect.quad[next * 2 + 1])) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool segmentIntersectsRect(float ax, float ay, float bx, float by, const RectConfig& rect) {
     if (!rect.enabled) return false;
-    if (rect.hasQuad) return segmentIntersectsQuad(ax, ay, bx, by, rect);
-    if (pointInsideRect(ax, ay, rect) || pointInsideRect(bx, by, rect)) return true;
+    for (int i = 0; i < rect.zoneCount; ++i) {
+        if (pointInsideZone(x, y, rect.zones[i])) return true;
+    }
+    return false;
+}
+
+bool segmentIntersectsZone(float ax, float ay, float bx, float by, const RectZone& zone) {
+    if (!zone.enabled) return false;
+    if (pointInsideZone(ax, ay, zone) || pointInsideZone(bx, by, zone)) return true;
 
     float lax = 0.0f;
     float lay = 0.0f;
     float lbx = 0.0f;
     float lby = 0.0f;
-    unrotatePoint(ax, ay, rect, &lax, &lay);
-    unrotatePoint(bx, by, rect, &lbx, &lby);
+    unrotatePointForZone(ax, ay, zone, &lax, &lay);
+    unrotatePointForZone(bx, by, zone, &lbx, &lby);
 
-    const float halfW = rect.width * 0.5f;
-    const float halfH = rect.height * 0.5f;
+    const float halfW = zone.width * 0.5f;
+    const float halfH = zone.height * 0.5f;
     float t0 = 0.0f;
     float t1 = 1.0f;
     const float dx = lbx - lax;
@@ -796,6 +753,14 @@ bool segmentIntersectsRect(float ax, float ay, float bx, float by, const RectCon
            clip(dx, halfW - lax) &&
            clip(-dy, lay + halfH) &&
            clip(dy, halfH - lay);
+}
+
+bool segmentIntersectsRect(float ax, float ay, float bx, float by, const RectConfig& rect) {
+    if (!rect.enabled) return false;
+    for (int i = 0; i < rect.zoneCount; ++i) {
+        if (segmentIntersectsZone(ax, ay, bx, by, rect.zones[i])) return true;
+    }
+    return false;
 }
 
 int getAbsRange(int fd, int code, AbsRange* range) {

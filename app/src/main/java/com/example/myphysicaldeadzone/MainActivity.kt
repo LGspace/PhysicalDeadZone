@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.text.InputType
+import android.util.Base64
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.Surface
@@ -29,11 +30,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import java.io.File
 import java.util.Locale
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlin.concurrent.thread
-import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.roundToInt
-import kotlin.math.sin
 
 class MainActivity : AppCompatActivity() {
 
@@ -176,6 +177,7 @@ class MainActivity : AppCompatActivity() {
         windowManager.defaultDisplay.getRealMetrics(metrics)
         screenW = metrics.widthPixels.coerceAtLeast(1)
         screenH = metrics.heightPixels.coerceAtLeast(1)
+        DeadZoneRegionStore.ensureMigrated(prefs, screenW, screenH)
         restorePixelsFromNormalizedPrefsIfNeeded()
         status = backend.loadStatus()
         overlayRunning = DeadZoneService.instance != null
@@ -313,10 +315,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun overlayPage() {
+        val editableNow = prefs.getBoolean(DeadZoneService.KEY_EDITABLE, true)
+        val regionCount = DeadZoneRegionStore.count(prefs)
+        val selectedRegion = DeadZoneRegionStore.selectedIndex(prefs)
         content.addView(row(
             tile("悬浮窗", if (overlayRunning) "显示中" else "未显示", overlayRunning),
             tile("模式", if (prefs.getBoolean(DeadZoneService.KEY_EDITABLE, true)) "编辑" else "穿透", true),
-            tile("尺寸", "${prefs.getInt(DeadZoneService.KEY_WIDTH, 360)} x ${prefs.getInt(DeadZoneService.KEY_HEIGHT, 78)}", true)
+            tile("区域", "${selectedRegion + 1} / $regionCount", true)
         ), lp(-1, tileRowHeight()))
         content.addView(buttons(mainButton(if (overlayRunning) "隐藏悬浮窗" else "显示悬浮窗") { toggleOverlay() }))
         content.addView(switchCard("编辑模式", prefs.getBoolean(DeadZoneService.KEY_EDITABLE, true)) {
@@ -329,26 +334,53 @@ class MainActivity : AppCompatActivity() {
             }
             render()
         })
-        content.addView(section("四边形预览"))
-        content.addView(QuadEditorView(this).apply {
-            val editableNow = prefs.getBoolean(DeadZoneService.KEY_EDITABLE, true)
-            isEnabled = editableNow
-            alpha = if (editableNow) 1f else 0.45f
-            background = stroke(Color.rgb(12, 16, 22), Color.rgb(48, 58, 72), 8)
-            setEditorState(
-                prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH),
-                prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT),
-                prefs.getInt(DeadZoneService.KEY_ROTATION, 0),
-                loadLocalPoints(
-                    prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH),
-                    prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT)
-                )
+        content.addView(section("阻断区域（最多8个矩形）"))
+        DeadZoneRegionStore.regions(prefs, screenW, screenH).forEachIndexed { index, region ->
+            content.addView(darkButton(
+                "${if (index == selectedRegion) "✓ " else ""}区域 ${index + 1} · ${if (region.enabled) "启用" else "停用"} · ${if (region.visualMode == DeadZoneService.VISUAL_MODE_ORIGINAL) "原始框" else region.labelText.ifBlank { "无文字" }}"
             ) {
-                if (!ensureEditModeForAdjustment()) return@setEditorState
-                saveLocalPoints(it)
-                applyOverlayThrottled()
+                if (!ensureEditModeForAdjustment()) return@darkButton
+                DeadZoneRegionStore.select(prefs, index, screenW, screenH)
+                DeadZoneService.instance?.reloadRegions()
+                render()
+            }, lp(-1, 48).apply { bottomMargin = dp(7) })
+        }
+        content.addView(buttons(
+            darkButton("新增区域") {
+                if (!ensureEditModeForAdjustment()) return@darkButton
+                if (DeadZoneRegionStore.add(prefs, screenW, screenH, dp(32)) == null) {
+                    Toast.makeText(this, "最多只能创建8个阻断区域", Toast.LENGTH_SHORT).show()
+                }
+                DeadZoneService.instance?.reloadRegions()
+                writeConfig()
+                render()
+            },
+            darkButton("复制当前") {
+                if (!ensureEditModeForAdjustment()) return@darkButton
+                if (DeadZoneRegionStore.duplicate(prefs, screenW, screenH, dp(32)) == null) {
+                    Toast.makeText(this, "最多只能创建8个阻断区域", Toast.LENGTH_SHORT).show()
+                }
+                DeadZoneService.instance?.reloadRegions()
+                writeConfig()
+                render()
+            },
+            darkButton("删除当前") {
+                if (!ensureEditModeForAdjustment()) return@darkButton
+                if (!DeadZoneRegionStore.deleteSelected(prefs, screenW, screenH)) {
+                    Toast.makeText(this, "至少需要保留一个阻断区域", Toast.LENGTH_SHORT).show()
+                }
+                DeadZoneService.instance?.reloadRegions()
+                writeConfig()
+                render()
             }
-        }, lp(-1, 220).apply { bottomMargin = dp(10) })
+        ))
+        content.addView(switchCard("启用当前区域", DeadZoneRegionStore.load(prefs, selectedRegion, screenW, screenH).enabled) {
+            if (!ensureEditModeForAdjustment()) return@switchCard
+            DeadZoneRegionStore.setEnabled(prefs, DeadZoneRegionStore.selectedIndex(prefs), it, screenW, screenH)
+            DeadZoneService.instance?.reloadRegions()
+            writeConfig()
+            render()
+        })
         content.addView(section("位置"))
         val currentWidth = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH).coerceIn(40, 5000)
         val currentHeight = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT).coerceIn(20, 5000)
@@ -361,7 +393,103 @@ class MainActivity : AppCompatActivity() {
         seek("高度", 20, screenH.coerceAtLeast(900), DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT)
         seek("旋转", -180, 180, DeadZoneService.KEY_ROTATION, 0)
         seek("圆角", 0, 240, DeadZoneService.KEY_CORNER, DeadZoneService.DEFAULT_CORNER)
-        seek("透明度", 20, 230, DeadZoneService.KEY_ALPHA, DeadZoneService.DEFAULT_ALPHA)
+        content.addView(section("显示模式"))
+        val selectedVisualMode = prefs.getString(DeadZoneService.KEY_VISUAL_MODE, DeadZoneService.DEFAULT_VISUAL_MODE)
+            ?: DeadZoneService.DEFAULT_VISUAL_MODE
+        fun selectVisualMode(mode: String) {
+            if (!ensureEditModeForAdjustment()) return
+            prefs.edit().putString(DeadZoneService.KEY_VISUAL_MODE, mode).apply()
+            applyOverlay()
+            render()
+        }
+        content.addView(buttons(
+            darkButton(
+                if (selectedVisualMode == DeadZoneService.VISUAL_MODE_ORIGINAL) "✓ 原始阻断框" else "原始阻断框"
+            ) { selectVisualMode(DeadZoneService.VISUAL_MODE_ORIGINAL) },
+            darkButton(
+                if (selectedVisualMode == DeadZoneService.VISUAL_MODE_TEXT) "✓ 镶嵌文字" else "镶嵌文字"
+            ) { selectVisualMode(DeadZoneService.VISUAL_MODE_TEXT) }
+        ))
+
+        if (selectedVisualMode == DeadZoneService.VISUAL_MODE_ORIGINAL) {
+            content.addView(log("显示原始红色半透明矩形和白色边框，实际阻断范围与矩形完全一致。"), lp(-1, -2).apply {
+                bottomMargin = dp(10)
+            })
+            seek("矩形透明", 20, 230, DeadZoneService.KEY_ALPHA, DeadZoneService.DEFAULT_ALPHA)
+        } else {
+        content.addView(section("镶嵌文字"))
+        content.addView(log("运行时矩形背景和边框完全透明，只显示下方文字；矩形本身仍是实际阻断范围。"), lp(-1, -2).apply {
+            bottomMargin = dp(10)
+        })
+
+        val textInput = EditText(this).apply {
+            setText(prefs.getString(DeadZoneService.KEY_LABEL_TEXT, DeadZoneService.DEFAULT_LABEL_TEXT))
+            hint = "输入一行文字"
+            isEnabled = editableNow
+            setTextColor(white)
+            setHintTextColor(gray)
+            setSingleLine(true)
+            maxLines = 1
+            setPadding(dp(14), 0, dp(14), 0)
+            background = round(card, 8)
+        }
+        content.addView(textInput, lp(-1, 52).apply { bottomMargin = dp(8) })
+
+        val storedTextColor = prefs.getInt(DeadZoneService.KEY_TEXT_COLOR, DeadZoneService.DEFAULT_TEXT_COLOR)
+        val colorInput = EditText(this).apply {
+            setText(String.format(Locale.US, "#%06X", storedTextColor and 0xFFFFFF))
+            hint = "文字颜色，例如 #FFFFFF"
+            isEnabled = editableNow
+            setTextColor(white)
+            setHintTextColor(gray)
+            setSingleLine(true)
+            setPadding(dp(14), 0, dp(14), 0)
+            background = round(card, 8)
+        }
+        content.addView(colorInput, lp(-1, 52).apply { bottomMargin = dp(8) })
+        content.addView(buttons(mainButton("应用文字和颜色") {
+            if (!ensureEditModeForAdjustment()) return@mainButton
+            val colorText = colorInput.text.toString().trim().let { if (it.startsWith("#")) it else "#$it" }
+            val parsedColor = try {
+                Color.parseColor(colorText)
+            } catch (_: IllegalArgumentException) {
+                Toast.makeText(this, "颜色格式无效，请使用 #RRGGBB", Toast.LENGTH_SHORT).show()
+                return@mainButton
+            }
+            prefs.edit()
+                .putString(DeadZoneService.KEY_LABEL_TEXT, textInput.text.toString().take(120))
+                .putInt(DeadZoneService.KEY_TEXT_COLOR, parsedColor or 0xFF000000.toInt())
+                .apply()
+            applyOverlay()
+            render()
+        }))
+
+        val selectedFont = prefs.getString(DeadZoneService.KEY_TEXT_FONT, DeadZoneService.DEFAULT_TEXT_FONT)
+        fun selectFont(font: String) {
+            if (!ensureEditModeForAdjustment()) return
+            prefs.edit().putString(DeadZoneService.KEY_TEXT_FONT, font).apply()
+            applyOverlay()
+            render()
+        }
+        content.addView(buttons(
+            darkButton(if (selectedFont == "sans") "✓ 默认字体" else "默认字体") { selectFont("sans") },
+            darkButton(if (selectedFont == "serif") "✓ 衬线字体" else "衬线字体") { selectFont("serif") },
+            darkButton(if (selectedFont == "mono") "✓ 等宽字体" else "等宽字体") { selectFont("mono") }
+        ))
+        seek("字号上限", 6, 240, DeadZoneService.KEY_TEXT_SIZE, DeadZoneService.DEFAULT_TEXT_SIZE)
+        seek("文字透明", 0, 255, DeadZoneService.KEY_TEXT_ALPHA, DeadZoneService.DEFAULT_TEXT_ALPHA)
+        seek("黑色描边", 0, 12, DeadZoneService.KEY_TEXT_STROKE, DeadZoneService.DEFAULT_TEXT_STROKE)
+        content.addView(switchCard("粗体", prefs.getBoolean(DeadZoneService.KEY_TEXT_BOLD, true)) {
+            prefs.edit().putBoolean(DeadZoneService.KEY_TEXT_BOLD, it).apply()
+            applyOverlay()
+            render()
+        })
+        content.addView(switchCard("斜体", prefs.getBoolean(DeadZoneService.KEY_TEXT_ITALIC, false)) {
+            prefs.edit().putBoolean(DeadZoneService.KEY_TEXT_ITALIC, it).apply()
+            applyOverlay()
+            render()
+        })
+        }
         content.addView(buttons(
             darkButton("回到中心") {
                 if (!ensureEditModeForAdjustment()) return@darkButton
@@ -381,7 +509,7 @@ class MainActivity : AppCompatActivity() {
                     .putInt(DeadZoneService.KEY_CORNER, DeadZoneService.DEFAULT_CORNER)
                     .putInt(DeadZoneService.KEY_ALPHA, DeadZoneService.DEFAULT_ALPHA)
                     .apply()
-                resetLocalPoints(DeadZoneService.DEFAULT_WIDTH, DeadZoneService.DEFAULT_HEIGHT)
+                prefs.edit().putBoolean(DeadZoneService.KEY_QUAD_ENABLED, false).apply()
                 applyOverlay()
                 render()
             }
@@ -389,7 +517,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun presetsPage() {
-        content.addView(section("配置预设"))
+        content.addView(section("整体配置预设"))
+        content.addView(log("新预设会保存并恢复全部1～8个阻断区域。旧版预设仍只应用到当前区域。"), lp(-1, -2).apply {
+            bottomMargin = dp(10)
+        })
         val names = presetNames().toList().sorted()
         if (names.isEmpty()) content.addView(log("还没有保存的配置"), lp(-1, -2))
         names.forEach { name ->
@@ -448,7 +579,7 @@ class MainActivity : AppCompatActivity() {
         val device = bp.getString(BackendController.KEY_DEVICE, "/dev/input/eventX")
         val screen = bp.getString(BackendController.KEY_SCREEN, backend.currentScreen())
         val commandPath = File(filesDir, BackendController.COMMAND_NAME).absolutePath
-        val cmd = "${BackendController.TARGET_PATH} --device $device --config ${File(filesDir, DeadZoneService.CONFIG_FILE).absolutePath} --screen $screen --state ${BackendController.STATE_PATH} --command $commandPath --rotate ${currentDisplayRotation()} --verbose --log-state"
+        val cmd = "${BackendController.TARGET_PATH} --device $device --config ${File(filesDir, DeadZoneService.CONFIG_FILE).absolutePath} --screen $screen --state ${BackendController.STATE_PATH} --command $commandPath --rotate ${currentDisplayRotation()} --emit --grab --verbose --log-state"
         content.addView(section("启动命令"))
         content.addView(log(cmd), lp(-1, -2).apply { bottomMargin = dp(10) })
         content.addView(info("校准字段", listOf(
@@ -459,20 +590,7 @@ class MainActivity : AppCompatActivity() {
         )))
         content.addView(buttons(
             mainButton("调试启动") {
-                if (!ensureOverlayService()) return@mainButton
-                DeadZoneService.instance?.refreshDaemonConfigFromActualView() ?: writeConfig()
-                debugLogText = "调试启动中..."
-                status = status.copy(message = "调试启动中...")
-                render()
-                thread {
-                    val next = backend.startBackend(File(filesDir, DeadZoneService.CONFIG_FILE).absolutePath, debugLog = true)
-                    val logText = backend.readLog()
-                    runOnUiThread {
-                        status = next
-                        debugLogText = logText.ifBlank { next.message }
-                        render()
-                    }
-                }
+                startDebugBackend()
             },
             mainButton("刷新状态") {
                 status = backend.loadStatus()
@@ -500,7 +618,7 @@ class MainActivity : AppCompatActivity() {
         ), lp(-1, tileRowHeight()))
         content.addView(info("控制说明", listOf(
             "通道" to "文件命令轮询，20ms 检查一次",
-            "SET_CONFIG" to "同步屏幕上真实四边形坐标",
+            "SET_CONFIG" to "同步屏幕上最多8个矩形区域坐标",
             "ENABLE" to "启用阻断并接管真实触摸",
             "DISABLE" to "暂停阻断并释放真实触摸"
         )))
@@ -579,6 +697,62 @@ class MainActivity : AppCompatActivity() {
                     recordControl("启动/SET_CONFIG/ENABLE", message)
                     status = enabled.copy(message = message)
                     Toast.makeText(this, if (backendEnabled(enabled, enabled.message)) "阻断已生效" else "阻断启用失败", Toast.LENGTH_SHORT).show()
+                    render()
+                }
+            }
+        }
+    }
+
+    private fun startDebugBackend() {
+        if (!ensureOverlayService()) return
+        refresh()
+        DeadZoneService.instance?.refreshDaemonConfigFromActualView()
+        prefs.edit().putBoolean(DeadZoneService.KEY_EDITABLE, false).apply()
+        applyOverlay()
+        debugLogText = "正在准备调试触摸接管..."
+        status = status.copy(message = "正在准备调试触摸接管...")
+        render()
+        Toast.makeText(this, "调试模式正在接管触摸", Toast.LENGTH_SHORT).show()
+
+        runWhenOverlayReady {
+            val config = DeadZoneService.instance?.actualConfigJson()
+            if (config.isNullOrBlank()) {
+                status = status.copy(message = "无法读取悬浮窗真实位置")
+                debugLogText = status.message
+                render()
+                return@runWhenOverlayReady
+            }
+
+            thread {
+                val started = backend.startBackend(
+                    File(filesDir, DeadZoneService.CONFIG_FILE).absolutePath,
+                    debugLog = true
+                )
+                if (!backendStartReady(started)) {
+                    val logText = backend.readLog()
+                    runOnUiThread {
+                        recordControl("调试启动", started.message)
+                        status = started
+                        debugLogText = logText.ifBlank { started.message }
+                        Toast.makeText(this, "调试触摸接管失败", Toast.LENGTH_SHORT).show()
+                        render()
+                    }
+                    return@thread
+                }
+
+                val configured = backend.sendConfig(config)
+                val enabled = if (controlOk(configured.message)) backend.enableBackend() else configured
+                val message = backendMessages(started, configured, enabled)
+                val logText = backend.readLog()
+                runOnUiThread {
+                    recordControl("调试启动/SET_CONFIG/ENABLE", message)
+                    status = enabled.copy(message = message)
+                    debugLogText = logText.ifBlank { message }
+                    Toast.makeText(
+                        this,
+                        if (backendEnabled(enabled, enabled.message)) "调试阻断已生效" else "调试阻断启用失败",
+                        Toast.LENGTH_SHORT
+                    ).show()
                     render()
                 }
             }
@@ -752,18 +926,7 @@ class MainActivity : AppCompatActivity() {
                 syncControls(pendingValue)
                 return
             }
-            val oldWidth = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH)
-            val oldHeight = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT)
             val value = clampParamValue(min, safeMax, rawValue)
-
-            if (key == DeadZoneService.KEY_WIDTH || key == DeadZoneService.KEY_HEIGHT) {
-                scaleLocalPointsForSize(
-                    oldWidth = oldWidth,
-                    oldHeight = oldHeight,
-                    newWidth = if (key == DeadZoneService.KEY_WIDTH) value else oldWidth,
-                    newHeight = if (key == DeadZoneService.KEY_HEIGHT) value else oldHeight
-                )
-            }
 
             prefs.edit().putInt(key, value).apply()
             if (key == DeadZoneService.KEY_WIDTH || key == DeadZoneService.KEY_HEIGHT) {
@@ -836,15 +999,8 @@ class MainActivity : AppCompatActivity() {
         clampSavedCenterInsideScreen()
         saveNormalizedPrefs()
         val serviceRunning = DeadZoneService.instance != null
-        val cx = prefs.getInt(DeadZoneService.KEY_CENTER_X, screenW / 2)
-        val cy = prefs.getInt(DeadZoneService.KEY_CENTER_Y, screenH / 2)
-        val w = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH)
-        val h = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT)
-        val r = prefs.getInt(DeadZoneService.KEY_ROTATION, 0)
-        val a = prefs.getInt(DeadZoneService.KEY_ALPHA, DeadZoneService.DEFAULT_ALPHA)
-        val c = prefs.getInt(DeadZoneService.KEY_CORNER, DeadZoneService.DEFAULT_CORNER)
-        val e = prefs.getBoolean(DeadZoneService.KEY_EDITABLE, true)
-        DeadZoneService.updateLayout(cx, cy, w, h, r, a, c, e, persist = false)
+        DeadZoneRegionStore.saveSelectedFromLegacy(prefs, screenW, screenH)
+        DeadZoneService.instance?.reloadRegions()
         if (!serviceRunning) writeConfig()
     }
 
@@ -870,44 +1026,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun restorePixelsFromNormalizedPrefsIfNeeded() {
-        val lastW = prefs.getInt(DeadZoneService.KEY_LAST_DISPLAY_W, 0)
-        val lastH = prefs.getInt(DeadZoneService.KEY_LAST_DISPLAY_H, 0)
-        val hasNormalized = prefs.contains(DeadZoneService.KEY_CENTER_X_PCT) && prefs.contains(DeadZoneService.KEY_CENTER_Y_PCT)
-        if (!hasNormalized) {
-            saveNormalizedPrefs()
-            return
-        }
-        if (lastW == screenW && lastH == screenH) return
-        val width = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH).coerceIn(40, 5000)
-        val height = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT).coerceIn(20, 5000)
-        val rotation = prefs.getInt(DeadZoneService.KEY_ROTATION, 0).coerceIn(-180, 180)
-        val limits = currentCenterLimits(width, height, rotation)
-        val centerX = limits.clampX((prefs.getFloat(DeadZoneService.KEY_CENTER_X_PCT, 0.5f) * screenW).roundToInt())
-        val centerY = limits.clampY((prefs.getFloat(DeadZoneService.KEY_CENTER_Y_PCT, 0.5f) * screenH).roundToInt())
-        prefs.edit()
-            .putInt(DeadZoneService.KEY_CENTER_X, centerX)
-            .putInt(DeadZoneService.KEY_CENTER_Y, centerY)
-            .putInt(DeadZoneService.KEY_WIDTH, width)
-            .putInt(DeadZoneService.KEY_HEIGHT, height)
-            .putInt(DeadZoneService.KEY_LAST_DISPLAY_W, screenW)
-            .putInt(DeadZoneService.KEY_LAST_DISPLAY_H, screenH)
-            .apply()
+        DeadZoneRegionStore.restoreForDisplay(prefs, screenW, screenH, dp(32))
+        DeadZoneRegionStore.loadSelectedIntoLegacy(prefs, screenW, screenH)
     }
 
     private fun saveNormalizedPrefs() {
-        val dw = screenW.coerceAtLeast(1).toFloat()
-        val dh = screenH.coerceAtLeast(1).toFloat()
-        prefs.edit()
-            .putFloat(DeadZoneService.KEY_CENTER_X_PCT, prefs.getInt(DeadZoneService.KEY_CENTER_X, screenW / 2) / dw)
-            .putFloat(DeadZoneService.KEY_CENTER_Y_PCT, prefs.getInt(DeadZoneService.KEY_CENTER_Y, screenH / 2) / dh)
-            .putInt(DeadZoneService.KEY_LAST_DISPLAY_W, screenW)
-            .putInt(DeadZoneService.KEY_LAST_DISPLAY_H, screenH)
-            .apply()
+        DeadZoneRegionStore.saveSelectedFromLegacy(prefs, screenW, screenH)
     }
 
     private fun currentCenterLimits(width: Int, height: Int, rotation: Int): DeadZoneGeometry.CenterLimits {
         return DeadZoneGeometry.centerLimits(
-            loadLocalPoints(width, height),
+            DeadZoneView.defaultLocalPoints(width, height),
             rotation,
             screenW,
             screenH,
@@ -931,129 +1060,40 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun writeConfig() {
-        val centerX = prefs.getInt(DeadZoneService.KEY_CENTER_X, screenW / 2)
-        val centerY = prefs.getInt(DeadZoneService.KEY_CENTER_Y, screenH / 2)
-        val width = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH)
-        val height = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT)
-        val rotation = prefs.getInt(DeadZoneService.KEY_ROTATION, 0)
-        val quad = absoluteQuadPoints(centerX.toFloat(), centerY.toFloat(), width, height, rotation)
-        val json = String.format(Locale.US, """{
-  "enabled": true,
-  "displayWidth": %d,
-  "displayHeight": %d,
-  "centerX": %d,
-  "centerY": %d,
-  "width": %d,
-  "height": %d,
-  "rotation": %d,
-  "alpha": %d,
-  "corner": %d,
-  "editable": %s,
-  "shape": "quad",
-  "points": [
-    { "x": %.1f, "y": %.1f },
-    { "x": %.1f, "y": %.1f },
-    { "x": %.1f, "y": %.1f },
-    { "x": %.1f, "y": %.1f }
-  ],
-  "p0x": %.1f,
-  "p0y": %.1f,
-  "p1x": %.1f,
-  "p1y": %.1f,
-  "p2x": %.1f,
-  "p2y": %.1f,
-  "p3x": %.1f,
-  "p3y": %.1f
-}
-""",
-            screenW, screenH,
-            centerX,
-            centerY,
-            width,
-            height,
-            rotation,
-            prefs.getInt(DeadZoneService.KEY_ALPHA, DeadZoneService.DEFAULT_ALPHA),
-            prefs.getInt(DeadZoneService.KEY_CORNER, DeadZoneService.DEFAULT_CORNER),
-            prefs.getBoolean(DeadZoneService.KEY_EDITABLE, true).toString(),
-            quad[0], quad[1],
-            quad[2], quad[3],
-            quad[4], quad[5],
-            quad[6], quad[7],
-            quad[0], quad[1],
-            quad[2], quad[3],
-            quad[4], quad[5],
-            quad[6], quad[7]
+        DeadZoneRegionStore.saveSelectedFromLegacy(prefs, screenW, screenH)
+        File(filesDir, DeadZoneService.CONFIG_FILE).writeText(
+            backendConfigJson(DeadZoneRegionStore.regions(prefs, screenW, screenH))
         )
-        File(filesDir, DeadZoneService.CONFIG_FILE).writeText(json)
     }
 
-    private fun absoluteQuadPoints(centerX: Float, centerY: Float, width: Int, height: Int, rotation: Int): FloatArray {
-        val points = loadLocalPoints(width, height)
-        val radians = Math.toRadians(rotation.toDouble())
-        val out = FloatArray(8)
-        for (i in 0 until 4) {
-            val lx = points[i * 2]
-            val ly = points[i * 2 + 1]
-            out[i * 2] = centerX + (lx * cos(radians) - ly * sin(radians)).toFloat()
-            out[i * 2 + 1] = centerY + (lx * sin(radians) + ly * cos(radians)).toFloat()
+    private fun backendConfigJson(regions: List<DeadZoneRegion>): String {
+        val first = regions.firstOrNull() ?: DeadZoneRegion(centerX = screenW / 2, centerY = screenH / 2)
+        return buildString {
+            appendLine("{")
+            appendLine("  \"enabled\": true,")
+            appendLine("  \"displayWidth\": $screenW,")
+            appendLine("  \"displayHeight\": $screenH,")
+            appendLine("  \"centerX\": ${first.centerX},")
+            appendLine("  \"centerY\": ${first.centerY},")
+            appendLine("  \"width\": ${first.width},")
+            appendLine("  \"height\": ${first.height},")
+            appendLine("  \"rotation\": ${first.rotation},")
+            appendLine("  \"zoneCount\": ${regions.size.coerceAtMost(DeadZoneRegionStore.MAX_REGIONS)},")
+            regions.take(DeadZoneRegionStore.MAX_REGIONS).forEachIndexed { index, region ->
+                appendLine("  \"z${index}Enabled\": ${region.enabled},")
+                appendLine("  \"z${index}CenterX\": ${region.centerX},")
+                appendLine("  \"z${index}CenterY\": ${region.centerY},")
+                appendLine("  \"z${index}Width\": ${region.width},")
+                appendLine("  \"z${index}Height\": ${region.height},")
+                appendLine("  \"z${index}Rotation\": ${region.rotation},")
+            }
+            appendLine("  \"editable\": ${prefs.getBoolean(DeadZoneService.KEY_EDITABLE, true)}")
+            appendLine("}")
         }
-        return out
-    }
-
-    private fun loadLocalPoints(width: Int, height: Int): FloatArray {
-        val defaults = DeadZoneView.defaultLocalPoints(width, height)
-        if (!prefs.getBoolean(DeadZoneService.KEY_QUAD_ENABLED, false)) return defaults
-        val out = FloatArray(8)
-        for (i in 0 until 4) {
-            out[i * 2] = prefs.getFloat("P${i}_X", defaults[i * 2])
-            out[i * 2 + 1] = prefs.getFloat("P${i}_Y", defaults[i * 2 + 1])
-        }
-        return out
-    }
-
-    private fun saveLocalPoints(points: FloatArray) {
-        prefs.edit()
-            .putBoolean(DeadZoneService.KEY_QUAD_ENABLED, true)
-            .putFloat("P0_X", points[0])
-            .putFloat("P0_Y", points[1])
-            .putFloat("P1_X", points[2])
-            .putFloat("P1_Y", points[3])
-            .putFloat("P2_X", points[4])
-            .putFloat("P2_Y", points[5])
-            .putFloat("P3_X", points[6])
-            .putFloat("P3_Y", points[7])
-            .apply()
-    }
-
-    private fun resetLocalPoints(width: Int, height: Int) {
-        val points = DeadZoneView.defaultLocalPoints(width, height)
-        prefs.edit()
-            .putBoolean(DeadZoneService.KEY_QUAD_ENABLED, false)
-            .putFloat("P0_X", points[0])
-            .putFloat("P0_Y", points[1])
-            .putFloat("P1_X", points[2])
-            .putFloat("P1_Y", points[3])
-            .putFloat("P2_X", points[4])
-            .putFloat("P2_Y", points[5])
-            .putFloat("P3_X", points[6])
-            .putFloat("P3_Y", points[7])
-            .apply()
-    }
-
-    private fun scaleLocalPointsForSize(oldWidth: Int, oldHeight: Int, newWidth: Int, newHeight: Int) {
-        if (!prefs.getBoolean(DeadZoneService.KEY_QUAD_ENABLED, false)) return
-        if (oldWidth <= 0 || oldHeight <= 0 || newWidth <= 0 || newHeight <= 0) return
-        val points = loadLocalPoints(oldWidth, oldHeight)
-        val scaleX = newWidth.toFloat() / oldWidth.toFloat()
-        val scaleY = newHeight.toFloat() / oldHeight.toFloat()
-        for (i in 0 until 4) {
-            points[i * 2] *= scaleX
-            points[i * 2 + 1] *= scaleY
-        }
-        saveLocalPoints(points)
     }
 
     private fun savePreset(name: String) {
+        DeadZoneRegionStore.saveSelectedFromLegacy(prefs, screenW, screenH)
         getSharedPreferences("DeadZonePresets", Context.MODE_PRIVATE).edit()
             .putStringSet("names", presetNames().plus(name))
             .putString(name, presetValue())
@@ -1062,8 +1102,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyPreset(name: String) {
         val value = getSharedPreferences("DeadZonePresets", Context.MODE_PRIVATE).getString(name, null) ?: return
+        if (!ensureEditModeForAdjustment()) return
+        if (value.trimStart().startsWith("{")) {
+            applyWholePresetJson(value)
+        } else {
+            applyLegacyPreset(value)
+        }
+    }
+
+    private fun applyLegacyPreset(value: String) {
         val rawParts = value.split(",")
-        val parts = rawParts.mapNotNull { it.toFloatOrNull() }
+        val parts = rawParts.take(16).mapNotNull { it.toFloatOrNull() }
         if (parts.size < 7) return
         prefs.edit()
             .putInt(DeadZoneService.KEY_CENTER_X, parts[0].roundToInt())
@@ -1074,20 +1123,98 @@ class MainActivity : AppCompatActivity() {
             .putInt(DeadZoneService.KEY_ALPHA, parts[5].roundToInt())
             .putInt(DeadZoneService.KEY_CORNER, parts[6].roundToInt())
             .apply()
-        if (parts.size >= 16) {
+        prefs.edit().putBoolean(DeadZoneService.KEY_QUAD_ENABLED, false).apply()
+        if (rawParts.size >= 24) {
+            val decodedText = try {
+                String(
+                    Base64.decode(rawParts[16], Base64.URL_SAFE or Base64.NO_WRAP),
+                    Charsets.UTF_8
+                )
+            } catch (_: IllegalArgumentException) {
+                DeadZoneService.DEFAULT_LABEL_TEXT
+            }
             prefs.edit()
-                .putBoolean(DeadZoneService.KEY_QUAD_ENABLED, parts[7].roundToInt() != 0)
-                .putFloat("P0_X", parts[8])
-                .putFloat("P0_Y", parts[9])
-                .putFloat("P1_X", parts[10])
-                .putFloat("P1_Y", parts[11])
-                .putFloat("P2_X", parts[12])
-                .putFloat("P2_Y", parts[13])
-                .putFloat("P3_X", parts[14])
-                .putFloat("P3_Y", parts[15])
+                .putString(DeadZoneService.KEY_LABEL_TEXT, decodedText)
+                .putString(DeadZoneService.KEY_TEXT_FONT, rawParts[17])
+                .putInt(DeadZoneService.KEY_TEXT_SIZE, rawParts[18].toIntOrNull() ?: DeadZoneService.DEFAULT_TEXT_SIZE)
+                .putInt(DeadZoneService.KEY_TEXT_COLOR, rawParts[19].toIntOrNull() ?: DeadZoneService.DEFAULT_TEXT_COLOR)
+                .putInt(DeadZoneService.KEY_TEXT_ALPHA, rawParts[20].toIntOrNull() ?: DeadZoneService.DEFAULT_TEXT_ALPHA)
+                .putBoolean(DeadZoneService.KEY_TEXT_BOLD, rawParts[21] == "1")
+                .putBoolean(DeadZoneService.KEY_TEXT_ITALIC, rawParts[22] == "1")
+                .putInt(DeadZoneService.KEY_TEXT_STROKE, rawParts[23].toIntOrNull() ?: DeadZoneService.DEFAULT_TEXT_STROKE)
                 .apply()
         }
+        prefs.edit().putString(
+            DeadZoneService.KEY_VISUAL_MODE,
+            if (rawParts.size >= 25 && rawParts[24] == DeadZoneService.VISUAL_MODE_ORIGINAL) {
+                DeadZoneService.VISUAL_MODE_ORIGINAL
+            } else {
+                DeadZoneService.VISUAL_MODE_TEXT
+            }
+        ).apply()
         applyOverlay()
+        writeConfig()
+        Toast.makeText(this, "旧预设已应用到当前区域", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun applyWholePresetJson(value: String) {
+        try {
+            val root = JSONObject(value)
+            if (root.optInt("version", 0) < 2) throw IllegalArgumentException("不支持的预设版本")
+            val array = root.optJSONArray("regions") ?: throw IllegalArgumentException("预设没有区域数据")
+            if (array.length() == 0) throw IllegalArgumentException("预设区域为空")
+            val restored = ArrayList<DeadZoneRegion>()
+            for (index in 0 until minOf(array.length(), DeadZoneRegionStore.MAX_REGIONS)) {
+                val item = array.getJSONObject(index)
+                val width = item.optInt("width", DeadZoneService.DEFAULT_WIDTH).coerceIn(40, 5000)
+                val height = item.optInt("height", DeadZoneService.DEFAULT_HEIGHT).coerceIn(20, 5000)
+                val rotation = item.optInt("rotation", 0).coerceIn(-180, 180)
+                val centerX = (item.optDouble("centerXPct", 0.5) * screenW).roundToInt()
+                val centerY = (item.optDouble("centerYPct", 0.5) * screenH).roundToInt()
+                val limits = DeadZoneGeometry.centerLimits(
+                    DeadZoneView.defaultLocalPoints(width, height),
+                    rotation,
+                    screenW,
+                    screenH,
+                    dp(32)
+                )
+                restored += DeadZoneRegion(
+                    enabled = item.optBoolean("enabled", true),
+                    centerX = limits.clampX(centerX),
+                    centerY = limits.clampY(centerY),
+                    width = width,
+                    height = height,
+                    rotation = rotation,
+                    corner = item.optInt("corner", DeadZoneService.DEFAULT_CORNER).coerceIn(0, 240),
+                    visualMode = if (item.optString("visualMode") == DeadZoneService.VISUAL_MODE_ORIGINAL) {
+                        DeadZoneService.VISUAL_MODE_ORIGINAL
+                    } else {
+                        DeadZoneService.VISUAL_MODE_TEXT
+                    },
+                    fillAlpha = item.optInt("fillAlpha", DeadZoneService.DEFAULT_ALPHA).coerceIn(20, 230),
+                    labelText = item.optString("labelText", DeadZoneService.DEFAULT_LABEL_TEXT).take(120),
+                    textSize = item.optInt("textSize", DeadZoneService.DEFAULT_TEXT_SIZE).coerceIn(6, 240),
+                    textColor = item.optInt("textColor", DeadZoneService.DEFAULT_TEXT_COLOR),
+                    textAlpha = item.optInt("textAlpha", DeadZoneService.DEFAULT_TEXT_ALPHA).coerceIn(0, 255),
+                    textFont = item.optString("textFont", DeadZoneService.DEFAULT_TEXT_FONT),
+                    textBold = item.optBoolean("textBold", true),
+                    textItalic = item.optBoolean("textItalic", false),
+                    textStroke = item.optInt("textStroke", DeadZoneService.DEFAULT_TEXT_STROKE).coerceIn(0, 12)
+                )
+            }
+            DeadZoneRegionStore.replaceAll(
+                prefs,
+                restored,
+                root.optInt("selectedRegion", 0),
+                screenW,
+                screenH
+            )
+            applyOverlay()
+            writeConfig()
+            Toast.makeText(this, "已恢复 ${restored.size} 个阻断区域", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "预设读取失败：${e.message.orEmpty()}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun deletePreset(name: String) {
@@ -1102,27 +1229,38 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun presetValue(): String {
-        val width = prefs.getInt(DeadZoneService.KEY_WIDTH, DeadZoneService.DEFAULT_WIDTH)
-        val height = prefs.getInt(DeadZoneService.KEY_HEIGHT, DeadZoneService.DEFAULT_HEIGHT)
-        val points = loadLocalPoints(width, height)
-        return listOf(
-            prefs.getInt(DeadZoneService.KEY_CENTER_X, screenW / 2),
-            prefs.getInt(DeadZoneService.KEY_CENTER_Y, screenH / 2),
-            width,
-            height,
-            prefs.getInt(DeadZoneService.KEY_ROTATION, 0),
-            prefs.getInt(DeadZoneService.KEY_ALPHA, DeadZoneService.DEFAULT_ALPHA),
-            prefs.getInt(DeadZoneService.KEY_CORNER, DeadZoneService.DEFAULT_CORNER),
-            if (prefs.getBoolean(DeadZoneService.KEY_QUAD_ENABLED, false)) 1 else 0,
-            points[0],
-            points[1],
-            points[2],
-            points[3],
-            points[4],
-            points[5],
-            points[6],
-            points[7]
-        ).joinToString(",")
+        val regions = DeadZoneRegionStore.regions(prefs, screenW, screenH)
+        val dw = screenW.coerceAtLeast(1).toDouble()
+        val dh = screenH.coerceAtLeast(1).toDouble()
+        val array = JSONArray()
+        regions.forEach { region ->
+            array.put(JSONObject().apply {
+                put("enabled", region.enabled)
+                put("centerXPct", region.centerX / dw)
+                put("centerYPct", region.centerY / dh)
+                put("width", region.width)
+                put("height", region.height)
+                put("rotation", region.rotation)
+                put("corner", region.corner)
+                put("visualMode", region.visualMode)
+                put("fillAlpha", region.fillAlpha)
+                put("labelText", region.labelText)
+                put("textSize", region.textSize)
+                put("textColor", region.textColor)
+                put("textAlpha", region.textAlpha)
+                put("textFont", region.textFont)
+                put("textBold", region.textBold)
+                put("textItalic", region.textItalic)
+                put("textStroke", region.textStroke)
+            })
+        }
+        return JSONObject().apply {
+            put("version", 2)
+            put("selectedRegion", DeadZoneRegionStore.selectedIndex(prefs))
+            put("displayWidth", screenW)
+            put("displayHeight", screenH)
+            put("regions", array)
+        }.toString()
     }
 
     private fun cn(value: String): String = when (value) {

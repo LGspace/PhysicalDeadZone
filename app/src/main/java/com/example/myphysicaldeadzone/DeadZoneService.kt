@@ -27,7 +27,6 @@ import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import java.io.File
-import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -38,19 +37,29 @@ import kotlin.math.sin
 
 class DeadZoneService : Service() {
 
+    private data class RegionOverlay(
+        val index: Int,
+        val view: DeadZoneView,
+        val layoutParams: WindowManager.LayoutParams,
+        var offsetX: Int = 0,
+        var offsetY: Int = 0,
+        var lastScreenX: Int = Int.MIN_VALUE,
+        var lastScreenY: Int = Int.MIN_VALUE
+    )
+
     private lateinit var windowManager: WindowManager
     private lateinit var prefs: SharedPreferences
     private lateinit var params: WindowManager.LayoutParams
     private val handler = Handler(Looper.getMainLooper())
 
     private var deadZoneView: DeadZoneView? = null
+    private val regionOverlays = mutableListOf<RegionOverlay>()
+    private var selectedRegionIndex = 0
     private var controlPanelView: View? = null
     private var controlPanelParams: WindowManager.LayoutParams? = null
     private var pendingDaemonConfigWrite: Runnable? = null
     private var windowOffsetX = 0
     private var windowOffsetY = 0
-    private var lastViewScreenX = Int.MIN_VALUE
-    private var lastViewScreenY = Int.MIN_VALUE
 
     private var dragStartRawX = 0f
     private var dragStartRawY = 0f
@@ -86,6 +95,15 @@ class DeadZoneService : Service() {
         const val KEY_CORNER = "CORNER"
         const val KEY_EDITABLE = "EDITABLE"
         const val KEY_QUAD_ENABLED = "QUAD_ENABLED"
+        const val KEY_LABEL_TEXT = "LABEL_TEXT"
+        const val KEY_TEXT_SIZE = "TEXT_SIZE"
+        const val KEY_TEXT_COLOR = "TEXT_COLOR"
+        const val KEY_TEXT_ALPHA = "TEXT_ALPHA"
+        const val KEY_TEXT_FONT = "TEXT_FONT"
+        const val KEY_TEXT_BOLD = "TEXT_BOLD"
+        const val KEY_TEXT_ITALIC = "TEXT_ITALIC"
+        const val KEY_TEXT_STROKE = "TEXT_STROKE"
+        const val KEY_VISUAL_MODE = "VISUAL_MODE"
         const val KEY_CENTER_X_PCT = "CENTER_X_PCT"
         const val KEY_CENTER_Y_PCT = "CENTER_Y_PCT"
         const val KEY_WIDTH_PCT = "WIDTH_PCT"
@@ -100,22 +118,18 @@ class DeadZoneService : Service() {
         const val DEFAULT_HEIGHT = 78
         const val DEFAULT_ALPHA = 150
         const val DEFAULT_CORNER = 18
+        const val DEFAULT_LABEL_TEXT = "阻断"
+        const val DEFAULT_TEXT_SIZE = 48
+        const val DEFAULT_TEXT_COLOR = Color.WHITE
+        const val DEFAULT_TEXT_ALPHA = 235
+        const val DEFAULT_TEXT_FONT = "sans"
+        const val DEFAULT_TEXT_STROKE = 2
+        const val VISUAL_MODE_ORIGINAL = "original"
+        const val VISUAL_MODE_TEXT = "text"
+        const val DEFAULT_VISUAL_MODE = VISUAL_MODE_TEXT
 
         var instance: DeadZoneService? = null
 
-        fun updateLayout(
-            centerX: Int,
-            centerY: Int,
-            width: Int,
-            height: Int,
-            rotation: Int,
-            alpha: Int,
-            corner: Int,
-            editable: Boolean,
-            persist: Boolean = true
-        ) {
-            instance?.updateWindow(centerX, centerY, width, height, rotation, alpha, corner, editable, persist)
-        }
     }
 
     override fun onCreate() {
@@ -128,20 +142,42 @@ class DeadZoneService : Service() {
     }
 
     private fun initDeadZone() {
-        deadZoneView = DeadZoneView(this).apply {
-            setOnTouchListener { _, event -> handleDeadZoneTouch(event) }
-            addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
-                view.post { syncActualLocationIfChanged(view) }
-            }
-            setOnApplyWindowInsetsListener { view, insets ->
-                view.post { syncActualLocationIfChanged(view) }
-                insets
+        DeadZoneRegionStore.ensureMigrated(prefs, currentDisplayWidth(), currentDisplayHeight())
+        reloadRegions()
+    }
+
+    fun reloadRegions() {
+        val displayWidth = currentDisplayWidth().coerceAtLeast(1)
+        val displayHeight = currentDisplayHeight().coerceAtLeast(1)
+        DeadZoneRegionStore.ensureMigrated(prefs, displayWidth, displayHeight)
+        DeadZoneRegionStore.saveSelectedFromLegacy(prefs, displayWidth, displayHeight)
+        DeadZoneRegionStore.restoreForDisplay(prefs, displayWidth, displayHeight, dp(MINIMUM_VISIBLE_DP))
+        val regions = DeadZoneRegionStore.regions(prefs, displayWidth, displayHeight)
+
+        while (regionOverlays.size > regions.size) {
+            val removed = regionOverlays.removeAt(regionOverlays.lastIndex)
+            try {
+                windowManager.removeView(removed.view)
+            } catch (_: Exception) {
             }
         }
-        params = WindowManager.LayoutParams().apply {
+        while (regionOverlays.size < regions.size) {
+            createRegionOverlay(regionOverlays.size)
+        }
+
+        selectedRegionIndex = DeadZoneRegionStore.selectedIndex(prefs).coerceIn(0, regions.lastIndex)
+        selectOverlay(selectedRegionIndex, syncPreferences = false)
+        val editable = prefs.getBoolean(KEY_EDITABLE, true)
+        regions.forEachIndexed { index, region -> updateRegionWindow(index, region, editable, persist = false) }
+    }
+
+    private fun createRegionOverlay(index: Int) {
+        val layoutParams = WindowManager.LayoutParams().apply {
             type = overlayType()
             format = PixelFormat.TRANSLUCENT
             gravity = Gravity.TOP or Gravity.LEFT
+            width = 1
+            height = 1
             flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
@@ -149,22 +185,48 @@ class DeadZoneService : Service() {
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
         }
-        applyPrefsToWindow()
-        windowManager.addView(deadZoneView, params)
+        val view = DeadZoneView(this).apply {
+            setOnTouchListener { _, event -> handleDeadZoneTouch(index, event) }
+            addOnLayoutChangeListener { changedView, _, _, _, _, _, _, _, _ ->
+                changedView.post { syncActualLocationIfChanged(index, changedView) }
+            }
+            setOnApplyWindowInsetsListener { changedView, insets ->
+                changedView.post { syncActualLocationIfChanged(index, changedView) }
+                insets
+            }
+        }
+        regionOverlays += RegionOverlay(index, view, layoutParams)
+        windowManager.addView(view, layoutParams)
     }
 
-    private fun handleDeadZoneTouch(event: MotionEvent): Boolean {
+    private fun selectOverlay(index: Int, syncPreferences: Boolean) {
+        val overlay = regionOverlays.getOrNull(index) ?: return
+        if (syncPreferences && index != DeadZoneRegionStore.selectedIndex(prefs)) {
+            DeadZoneRegionStore.select(prefs, index, currentDisplayWidth(), currentDisplayHeight())
+        }
+        selectedRegionIndex = index
+        deadZoneView = overlay.view
+        params = overlay.layoutParams
+        windowOffsetX = overlay.offsetX
+        windowOffsetY = overlay.offsetY
+        regionOverlays.forEachIndexed { regionIndex, regionOverlay ->
+            regionOverlay.view.setSelectedForEditing(regionIndex == index)
+        }
+    }
+
+    private fun handleDeadZoneTouch(index: Int, event: MotionEvent): Boolean {
         if (!prefs.getBoolean(KEY_EDITABLE, true)) return false
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                selectOverlay(index, syncPreferences = true)
                 dragStartRawX = event.rawX
                 dragStartRawY = event.rawY
                 longPressStartRawX = event.rawX
                 longPressStartRawY = event.rawY
                 longPressTriggered = false
                 isOverlayDragging = true
-                deadZoneView?.let { updateWindowOffsetFromView(it) }
+                deadZoneView?.let { updateWindowOffsetFromView(selectedRegionIndex, it) }
                 dragStartCenterX = params.x + windowOffsetX + params.width / 2
                 dragStartCenterY = params.y + windowOffsetY + params.height / 2
                 scheduleControlPanelLongPress()
@@ -186,7 +248,7 @@ class DeadZoneService : Service() {
                 cancelControlPanelLongPress()
                 dragStartRawX = event.rawX
                 dragStartRawY = event.rawY
-                deadZoneView?.let { updateWindowOffsetFromView(it) }
+                deadZoneView?.let { updateWindowOffsetFromView(selectedRegionIndex, it) }
                 dragStartCenterX = params.x + windowOffsetX + params.width / 2
                 dragStartCenterY = params.y + windowOffsetY + params.height / 2
                 isOverlayDragging = true
@@ -205,7 +267,6 @@ class DeadZoneService : Service() {
                         (transformStartWidth * scale).roundToInt(),
                         (transformStartHeight * scale).roundToInt(),
                         normalizeRotation((transformStartRotation + angleDelta).roundToInt()),
-                        prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA),
                         prefs.getInt(KEY_CORNER, DEFAULT_CORNER),
                         true
                     )
@@ -216,7 +277,6 @@ class DeadZoneService : Service() {
                         prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH),
                         prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT),
                         prefs.getInt(KEY_ROTATION, 0),
-                        prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA),
                         prefs.getInt(KEY_CORNER, DEFAULT_CORNER),
                         true
                     )
@@ -268,40 +328,62 @@ class DeadZoneService : Service() {
         return normalized
     }
 
-    private fun applyPrefsToWindow() {
-        restorePixelsFromNormalizedPrefsIfNeeded()
-        updateWindow(
-            prefs.getInt(KEY_CENTER_X, DEFAULT_CENTER_X),
-            prefs.getInt(KEY_CENTER_Y, DEFAULT_CENTER_Y),
-            prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH),
-            prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT),
-            prefs.getInt(KEY_ROTATION, 0),
-            prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA),
-            prefs.getInt(KEY_CORNER, DEFAULT_CORNER),
-            prefs.getBoolean(KEY_EDITABLE, true),
-            persist = false
-        )
-    }
-
     fun updateWindow(
         centerX: Int,
         centerY: Int,
         width: Int,
         height: Int,
         rotation: Int,
-        alpha: Int,
         corner: Int,
         editable: Boolean,
         persist: Boolean = true
     ) {
-        val safeWidth = width.coerceIn(40, 5000)
-        val safeHeight = height.coerceIn(20, 5000)
-        val safeRotation = rotation.coerceIn(-180, 180)
-        val safeAlpha = alpha.coerceIn(20, 230)
-        val safeCorner = corner.coerceIn(0, 240)
+        val displayWidth = currentDisplayWidth().coerceAtLeast(1)
+        val displayHeight = currentDisplayHeight().coerceAtLeast(1)
+        val current = DeadZoneRegionStore.load(prefs, selectedRegionIndex, displayWidth, displayHeight)
+        val updated = current.copy(
+            centerX = centerX,
+            centerY = centerY,
+            width = width,
+            height = height,
+            rotation = rotation,
+            corner = corner,
+            visualMode = prefs.getString(KEY_VISUAL_MODE, current.visualMode) ?: current.visualMode,
+            fillAlpha = prefs.getInt(KEY_ALPHA, current.fillAlpha),
+            labelText = prefs.getString(KEY_LABEL_TEXT, current.labelText) ?: current.labelText,
+            textSize = prefs.getInt(KEY_TEXT_SIZE, current.textSize),
+            textColor = prefs.getInt(KEY_TEXT_COLOR, current.textColor),
+            textAlpha = prefs.getInt(KEY_TEXT_ALPHA, current.textAlpha),
+            textFont = prefs.getString(KEY_TEXT_FONT, current.textFont) ?: current.textFont,
+            textBold = prefs.getBoolean(KEY_TEXT_BOLD, current.textBold),
+            textItalic = prefs.getBoolean(KEY_TEXT_ITALIC, current.textItalic),
+            textStroke = prefs.getInt(KEY_TEXT_STROKE, current.textStroke)
+        )
+        updateRegionWindow(selectedRegionIndex, updated, editable, persist)
+        if (persist) DeadZoneRegionStore.loadSelectedIntoLegacy(prefs, displayWidth, displayHeight)
+    }
 
-        val points = loadLocalPoints(safeWidth, safeHeight)
-        deadZoneView?.setConfig(safeWidth, safeHeight, safeRotation, safeAlpha, safeCorner, points)
+    private fun updateRegionWindow(index: Int, region: DeadZoneRegion, editable: Boolean, persist: Boolean) {
+        val overlay = regionOverlays.getOrNull(index) ?: return
+        val safeWidth = region.width.coerceIn(40, 5000)
+        val safeHeight = region.height.coerceIn(20, 5000)
+        val safeRotation = region.rotation.coerceIn(-180, 180)
+        val safeCorner = region.corner.coerceIn(0, 240)
+
+        val points = DeadZoneView.defaultLocalPoints(safeWidth, safeHeight)
+        overlay.view.setConfig(safeWidth, safeHeight, safeRotation, DEFAULT_ALPHA, safeCorner, points, editable)
+        overlay.view.setVisualMode(region.visualMode, region.fillAlpha)
+        overlay.view.setTextConfig(
+            region.labelText,
+            region.textSize,
+            region.textColor,
+            region.textAlpha,
+            region.textFont,
+            region.textBold,
+            region.textItalic,
+            region.textStroke
+        )
+        overlay.view.visibility = if (region.enabled) View.VISIBLE else View.GONE
 
         val bounds = polygonBounds(points, safeRotation)
         val displayWidth = currentDisplayWidth().coerceAtLeast(1)
@@ -313,171 +395,97 @@ class DeadZoneService : Service() {
             displayHeight,
             dp(MINIMUM_VISIBLE_DP)
         )
-        val safeCenterX = centerLimits.clampX(centerX)
-        val safeCenterY = centerLimits.clampY(centerY)
-        params.width = bounds.first.coerceIn(1, displayWidth)
-        params.height = bounds.second.coerceIn(1, displayHeight)
-        params.x = safeCenterX - windowOffsetX - params.width / 2
-        params.y = safeCenterY - windowOffsetY - params.height / 2
-        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+        val safeCenterX = centerLimits.clampX(region.centerX)
+        val safeCenterY = centerLimits.clampY(region.centerY)
+        overlay.layoutParams.width = bounds.first.coerceIn(1, displayWidth)
+        overlay.layoutParams.height = bounds.second.coerceIn(1, displayHeight)
+        overlay.layoutParams.x = safeCenterX - overlay.offsetX - overlay.layoutParams.width / 2
+        overlay.layoutParams.y = safeCenterY - overlay.offsetY - overlay.layoutParams.height / 2
+        overlay.layoutParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
             (if (editable) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
 
-        val actualCenterX = safeCenterX
-        val actualCenterY = safeCenterY
         if (persist) {
-            prefs.edit()
-                .putInt(KEY_CENTER_X, actualCenterX)
-                .putInt(KEY_CENTER_Y, actualCenterY)
-                .putInt(KEY_WIDTH, safeWidth)
-                .putInt(KEY_HEIGHT, safeHeight)
-                .putInt(KEY_ROTATION, safeRotation)
-                .putInt(KEY_ALPHA, safeAlpha)
-                .putInt(KEY_CORNER, safeCorner)
-            .putBoolean(KEY_EDITABLE, editable)
-                .apply()
-            saveNormalizedPrefs(actualCenterX, actualCenterY, displayWidth, displayHeight)
+            val saved = region.copy(
+                centerX = safeCenterX,
+                centerY = safeCenterY,
+                width = safeWidth,
+                height = safeHeight,
+                rotation = safeRotation,
+                corner = safeCorner
+            )
+            DeadZoneRegionStore.save(prefs, index, saved, displayWidth, displayHeight)
+            if (index == selectedRegionIndex) {
+                prefs.edit().putBoolean(KEY_EDITABLE, editable).apply()
+                DeadZoneRegionStore.loadSelectedIntoLegacy(prefs, displayWidth, displayHeight)
+            }
         }
 
-        deadZoneView?.let {
-            try {
-                windowManager.updateViewLayout(it, params)
-            } catch (_: IllegalArgumentException) {
-            }
-            it.post {
-                updateWindowOffsetFromView(it)
-                if (!editable) {
-                    scheduleDaemonConfigWrite(it, safeWidth, safeHeight, safeRotation, safeAlpha, safeCorner, editable)
-                }
-            }
+        try {
+            windowManager.updateViewLayout(overlay.view, overlay.layoutParams)
+        } catch (_: IllegalArgumentException) {
+        }
+        overlay.view.post {
+            updateWindowOffsetFromView(index, overlay.view)
+            if (!editable) scheduleDaemonConfigWrite()
         }
     }
 
-    private fun updateWindowOffsetFromView(view: View) {
+    private fun updateWindowOffsetFromView(index: Int, view: View) {
+        val overlay = regionOverlays.getOrNull(index) ?: return
         val location = IntArray(2)
         view.getLocationOnScreen(location)
-        windowOffsetX = location[0] - params.x
-        windowOffsetY = location[1] - params.y
+        overlay.offsetX = location[0] - overlay.layoutParams.x
+        overlay.offsetY = location[1] - overlay.layoutParams.y
+        if (index == selectedRegionIndex) {
+            windowOffsetX = overlay.offsetX
+            windowOffsetY = overlay.offsetY
+        }
     }
 
-    private fun syncActualLocationIfChanged(view: View) {
+    private fun syncActualLocationIfChanged(index: Int, view: View) {
         if (view.width <= 0 || view.height <= 0 || isOverlayDragging) return
-        val deadZone = view as? DeadZoneView ?: return
+        val overlay = regionOverlays.getOrNull(index) ?: return
         val location = IntArray(2)
         view.getLocationOnScreen(location)
-        val changed = location[0] != lastViewScreenX || location[1] != lastViewScreenY
-        windowOffsetX = location[0] - params.x
-        windowOffsetY = location[1] - params.y
+        val changed = location[0] != overlay.lastScreenX || location[1] != overlay.lastScreenY
+        overlay.offsetX = location[0] - overlay.layoutParams.x
+        overlay.offsetY = location[1] - overlay.layoutParams.y
         if (!changed) return
 
-        lastViewScreenX = location[0]
-        lastViewScreenY = location[1]
+        overlay.lastScreenX = location[0]
+        overlay.lastScreenY = location[1]
         if (!prefs.getBoolean(KEY_EDITABLE, true)) {
-            scheduleDaemonConfigWrite(
-                deadZone,
-                prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH).coerceIn(40, 5000),
-                prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT).coerceIn(20, 5000),
-                prefs.getInt(KEY_ROTATION, 0).coerceIn(-180, 180),
-                prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA).coerceIn(20, 230),
-                prefs.getInt(KEY_CORNER, DEFAULT_CORNER).coerceIn(0, 240),
-                false
-            )
+            scheduleDaemonConfigWrite()
         }
     }
 
     private fun restorePixelsFromNormalizedPrefsIfNeeded() {
         val displayWidth = currentDisplayWidth().coerceAtLeast(1)
         val displayHeight = currentDisplayHeight().coerceAtLeast(1)
-        val lastWidth = prefs.getInt(KEY_LAST_DISPLAY_W, 0)
-        val lastHeight = prefs.getInt(KEY_LAST_DISPLAY_H, 0)
-        val hasNormalized = prefs.contains(KEY_CENTER_X_PCT) && prefs.contains(KEY_CENTER_Y_PCT)
-        if (!hasNormalized) {
-            saveNormalizedPrefs(
-                prefs.getInt(KEY_CENTER_X, displayWidth / 2),
-                prefs.getInt(KEY_CENTER_Y, displayHeight / 2),
-                displayWidth,
-                displayHeight
-            )
-            return
-        }
-        if (lastWidth == displayWidth && lastHeight == displayHeight) return
-        val width = prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH).coerceIn(40, 5000)
-        val height = prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT).coerceIn(20, 5000)
-        val centerX = (prefs.getFloat(KEY_CENTER_X_PCT, 0.5f) * displayWidth).roundToInt()
-        val centerY = (prefs.getFloat(KEY_CENTER_Y_PCT, 0.5f) * displayHeight).roundToInt()
-        val points = loadLocalPoints(width, height)
-        val limits = DeadZoneGeometry.centerLimits(
-            points,
-            prefs.getInt(KEY_ROTATION, 0).coerceIn(-180, 180),
-            displayWidth,
-            displayHeight,
-            dp(MINIMUM_VISIBLE_DP)
-        )
-        prefs.edit()
-            .putInt(KEY_CENTER_X, limits.clampX(centerX))
-            .putInt(KEY_CENTER_Y, limits.clampY(centerY))
-            .putInt(KEY_WIDTH, width)
-            .putInt(KEY_HEIGHT, height)
-            .putInt(KEY_LAST_DISPLAY_W, displayWidth)
-            .putInt(KEY_LAST_DISPLAY_H, displayHeight)
-            .apply()
-    }
-
-    private fun saveNormalizedPrefs(centerX: Int, centerY: Int, displayWidth: Int, displayHeight: Int) {
-        val dw = displayWidth.coerceAtLeast(1).toFloat()
-        val dh = displayHeight.coerceAtLeast(1).toFloat()
-        prefs.edit()
-            .putFloat(KEY_CENTER_X_PCT, centerX / dw)
-            .putFloat(KEY_CENTER_Y_PCT, centerY / dh)
-            .putInt(KEY_LAST_DISPLAY_W, displayWidth)
-            .putInt(KEY_LAST_DISPLAY_H, displayHeight)
-            .apply()
+        DeadZoneRegionStore.restoreForDisplay(prefs, displayWidth, displayHeight, dp(MINIMUM_VISIBLE_DP))
+        DeadZoneRegionStore.loadSelectedIntoLegacy(prefs, displayWidth, displayHeight)
     }
 
     fun refreshDaemonConfigFromActualView() {
         pendingDaemonConfigWrite?.let { handler.removeCallbacks(it) }
         pendingDaemonConfigWrite = null
-        val view = deadZoneView ?: return
-        writeDaemonConfigFromActualView(
-            view,
-            prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH).coerceIn(40, 5000),
-            prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT).coerceIn(20, 5000),
-            prefs.getInt(KEY_ROTATION, 0).coerceIn(-180, 180),
-            prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA).coerceIn(20, 230),
-            prefs.getInt(KEY_CORNER, DEFAULT_CORNER).coerceIn(0, 240),
-            prefs.getBoolean(KEY_EDITABLE, true)
-        )
+        writeDaemonConfigFromAllViews()
     }
 
     fun actualConfigJson(): String? {
         pendingDaemonConfigWrite?.let { handler.removeCallbacks(it) }
         pendingDaemonConfigWrite = null
-        val view = deadZoneView ?: return null
-        return daemonConfigJsonFromActualView(
-            view,
-            prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH).coerceIn(40, 5000),
-            prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT).coerceIn(20, 5000),
-            prefs.getInt(KEY_ROTATION, 0).coerceIn(-180, 180),
-            prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA).coerceIn(20, 230),
-            prefs.getInt(KEY_CORNER, DEFAULT_CORNER).coerceIn(0, 240),
-            prefs.getBoolean(KEY_EDITABLE, true)
-        )
+        if (regionOverlays.isEmpty()) return null
+        return daemonConfigJsonForRegions(actualRegions())
     }
 
-    private fun scheduleDaemonConfigWrite(
-        view: DeadZoneView,
-        width: Int,
-        height: Int,
-        rotation: Int,
-        alpha: Int,
-        corner: Int,
-        editable: Boolean
-    ) {
+    private fun scheduleDaemonConfigWrite() {
         pendingDaemonConfigWrite?.let { handler.removeCallbacks(it) }
         val runnable = Runnable {
             pendingDaemonConfigWrite = null
-            writeDaemonConfigFromActualView(view, width, height, rotation, alpha, corner, editable)
+            writeDaemonConfigFromAllViews()
         }
         pendingDaemonConfigWrite = runnable
         handler.postDelayed(runnable, 40L)
@@ -498,7 +506,7 @@ class DeadZoneService : Service() {
         val currentHeight = prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT).coerceIn(20, 5000)
         val currentRotation = prefs.getInt(KEY_ROTATION, 0).coerceIn(-180, 180)
         val centerLimits = DeadZoneGeometry.centerLimits(
-            loadLocalPoints(currentWidth, currentHeight),
+            DeadZoneView.defaultLocalPoints(currentWidth, currentHeight),
             currentRotation,
             currentDisplayWidth(),
             currentDisplayHeight(),
@@ -522,7 +530,7 @@ class DeadZoneService : Service() {
             setOnTouchListener { _, event -> handlePanelDrag(event) }
         }
         titleRow.addView(TextView(this).apply {
-            text = "阻断条调节"
+            text = "阻断条调节 · 区域 ${selectedRegionIndex + 1}"
             setTextColor(Color.WHITE)
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
@@ -542,11 +550,9 @@ class DeadZoneService : Service() {
             updateFromPanel(centerY = it)
         }
         addPanelSeekRow(panel, "宽度", 40, currentDisplayWidth().coerceAtLeast(1400), prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH)) {
-            scaleQuadToSize(newWidth = it, newHeight = prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT))
             updateFromPanel(width = it)
         }
         addPanelSeekRow(panel, "高度", 20, currentDisplayHeight().coerceAtLeast(900), prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT)) {
-            scaleQuadToSize(newWidth = prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH), newHeight = it)
             updateFromPanel(height = it)
         }
         addPanelSeekRow(panel, "旋转", -180, 180, prefs.getInt(KEY_ROTATION, 0)) {
@@ -555,14 +561,6 @@ class DeadZoneService : Service() {
         addPanelSeekRow(panel, "圆角", 0, 240, prefs.getInt(KEY_CORNER, DEFAULT_CORNER)) {
             updateFromPanel(corner = it)
         }
-        addPanelSeekRow(panel, "透明", 20, 230, prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA)) {
-            updateFromPanel(alpha = it)
-        }
-        panel.addView(panelButton("重置为矩形") {
-            resetQuadToRectangle()
-            updateFromPanel()
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44)))
-
         controlPanelParams = WindowManager.LayoutParams().apply {
             type = overlayType()
             format = PixelFormat.TRANSLUCENT
@@ -633,16 +631,10 @@ class DeadZoneService : Service() {
     }
 
     private fun lockOverlayFromPanel() {
-        updateWindow(
-            prefs.getInt(KEY_CENTER_X, DEFAULT_CENTER_X),
-            prefs.getInt(KEY_CENTER_Y, DEFAULT_CENTER_Y),
-            prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH),
-            prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT),
-            prefs.getInt(KEY_ROTATION, 0),
-            prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA),
-            prefs.getInt(KEY_CORNER, DEFAULT_CORNER),
-            editable = false
-        )
+        DeadZoneRegionStore.saveSelectedFromLegacy(prefs, currentDisplayWidth(), currentDisplayHeight())
+        prefs.edit().putBoolean(KEY_EDITABLE, false).apply()
+        reloadRegions()
+        refreshDaemonConfigFromActualView()
         hideControlPanel()
     }
 
@@ -708,57 +700,9 @@ class DeadZoneService : Service() {
         width: Int = prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH),
         height: Int = prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT),
         rotation: Int = prefs.getInt(KEY_ROTATION, 0),
-        alpha: Int = prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA),
         corner: Int = prefs.getInt(KEY_CORNER, DEFAULT_CORNER)
     ) {
-        updateWindow(centerX, centerY, width, height, rotation, alpha, corner, prefs.getBoolean(KEY_EDITABLE, true))
-    }
-
-    private fun resetQuadToRectangle(
-        width: Int = prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH),
-        height: Int = prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT)
-    ) {
-        saveLocalPoints(DeadZoneView.defaultLocalPoints(width, height))
-    }
-
-    private fun scaleQuadToSize(newWidth: Int, newHeight: Int) {
-        if (!prefs.getBoolean(KEY_QUAD_ENABLED, false)) return
-        val oldWidth = prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH)
-        val oldHeight = prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT)
-        if (oldWidth <= 0 || oldHeight <= 0 || newWidth <= 0 || newHeight <= 0) return
-        val points = loadLocalPoints(oldWidth, oldHeight)
-        val scaleX = newWidth.toFloat() / oldWidth.toFloat()
-        val scaleY = newHeight.toFloat() / oldHeight.toFloat()
-        for (i in 0 until 4) {
-            points[i * 2] *= scaleX
-            points[i * 2 + 1] *= scaleY
-        }
-        saveLocalPoints(points)
-    }
-
-    private fun loadLocalPoints(width: Int, height: Int): FloatArray {
-        val defaults = DeadZoneView.defaultLocalPoints(width, height)
-        if (!prefs.getBoolean(KEY_QUAD_ENABLED, false)) return defaults
-        val out = FloatArray(8)
-        for (i in 0 until 4) {
-            out[i * 2] = prefs.getFloat("P${i}_X", defaults[i * 2])
-            out[i * 2 + 1] = prefs.getFloat("P${i}_Y", defaults[i * 2 + 1])
-        }
-        return out
-    }
-
-    private fun saveLocalPoints(points: FloatArray) {
-        prefs.edit()
-            .putBoolean(KEY_QUAD_ENABLED, true)
-            .putFloat("P0_X", points[0])
-            .putFloat("P0_Y", points[1])
-            .putFloat("P1_X", points[2])
-            .putFloat("P1_Y", points[3])
-            .putFloat("P2_X", points[4])
-            .putFloat("P2_Y", points[5])
-            .putFloat("P3_X", points[6])
-            .putFloat("P3_Y", points[7])
-            .apply()
+        updateWindow(centerX, centerY, width, height, rotation, corner, prefs.getBoolean(KEY_EDITABLE, true))
     }
 
     private fun polygonBounds(points: FloatArray, rotation: Int): Pair<Int, Int> {
@@ -782,169 +726,55 @@ class DeadZoneService : Service() {
         return position.coerceIn(0, maxPosition)
     }
 
-    private fun absoluteQuadPoints(centerX: Float, centerY: Float, width: Int, height: Int, rotation: Int): FloatArray {
-        val points = loadLocalPoints(width, height)
-        val radians = Math.toRadians(rotation.toDouble())
-        val out = FloatArray(8)
-        for (i in 0 until 4) {
-            val lx = points[i * 2]
-            val ly = points[i * 2 + 1]
-            out[i * 2] = centerX + (lx * cos(radians) - ly * sin(radians)).toFloat()
-            out[i * 2 + 1] = centerY + (lx * sin(radians) + ly * cos(radians)).toFloat()
+    private fun actualRegions(): List<DeadZoneRegion> {
+        val displayWidth = currentDisplayWidth().coerceAtLeast(1)
+        val displayHeight = currentDisplayHeight().coerceAtLeast(1)
+        val stored = DeadZoneRegionStore.regions(prefs, displayWidth, displayHeight)
+        return stored.mapIndexed { index, region ->
+            val overlay = regionOverlays.getOrNull(index) ?: return@mapIndexed region
+            if (overlay.view.width <= 0 || overlay.view.height <= 0) return@mapIndexed region
+            val location = IntArray(2)
+            overlay.view.getLocationOnScreen(location)
+            region.copy(
+                centerX = location[0] + overlay.view.width / 2,
+                centerY = location[1] + overlay.view.height / 2
+            )
         }
-        return out
     }
 
-    private fun writeDaemonConfig(
-        centerX: Int,
-        centerY: Int,
-        width: Int,
-        height: Int,
-        rotation: Int,
-        alpha: Int,
-        corner: Int,
-        editable: Boolean
-    ) {
-        val quad = absoluteQuadPoints(centerX.toFloat(), centerY.toFloat(), width, height, rotation)
-        writeDaemonConfigWithQuad(centerX, centerY, width, height, rotation, alpha, corner, editable, quad)
-    }
-
-    private fun writeDaemonConfigWithQuad(
-        centerX: Int,
-        centerY: Int,
-        width: Int,
-        height: Int,
-        rotation: Int,
-        alpha: Int,
-        corner: Int,
-        editable: Boolean,
-        quad: FloatArray
-    ) {
-        val json = daemonConfigJsonWithQuad(centerX, centerY, width, height, rotation, alpha, corner, editable, quad)
+    private fun writeDaemonConfigFromAllViews() {
         try {
-            File(filesDir, CONFIG_FILE).writeText(json)
+            File(filesDir, CONFIG_FILE).writeText(daemonConfigJsonForRegions(actualRegions()))
         } catch (_: Exception) {
         }
     }
 
-    private fun daemonConfigJsonWithQuad(
-        centerX: Int,
-        centerY: Int,
-        width: Int,
-        height: Int,
-        rotation: Int,
-        alpha: Int,
-        corner: Int,
-        editable: Boolean,
-        quad: FloatArray
-    ): String {
-        return String.format(
-            Locale.US,
-            """{
-  "enabled": true,
-  "displayWidth": %d,
-  "displayHeight": %d,
-  "centerX": %d,
-  "centerY": %d,
-  "width": %d,
-  "height": %d,
-  "rotation": %d,
-  "alpha": %d,
-  "corner": %d,
-  "editable": %s,
-  "shape": "quad",
-  "points": [
-    { "x": %.1f, "y": %.1f },
-    { "x": %.1f, "y": %.1f },
-    { "x": %.1f, "y": %.1f },
-    { "x": %.1f, "y": %.1f }
-  ],
-  "p0x": %.1f,
-  "p0y": %.1f,
-  "p1x": %.1f,
-  "p1y": %.1f,
-  "p2x": %.1f,
-  "p2y": %.1f,
-  "p3x": %.1f,
-  "p3y": %.1f
-}
-""",
-            currentDisplayWidth(),
-            currentDisplayHeight(),
-            centerX,
-            centerY,
-            width,
-            height,
-            rotation,
-            alpha,
-            corner,
-            editable.toString(),
-            quad[0],
-            quad[1],
-            quad[2],
-            quad[3],
-            quad[4],
-            quad[5],
-            quad[6],
-            quad[7],
-            quad[0],
-            quad[1],
-            quad[2],
-            quad[3],
-            quad[4],
-            quad[5],
-            quad[6],
-            quad[7]
-        )
-    }
-
-    private fun writeDaemonConfigFromActualView(
-        view: DeadZoneView,
-        width: Int,
-        height: Int,
-        rotation: Int,
-        alpha: Int,
-        corner: Int,
-        editable: Boolean
-    ) {
-        val location = IntArray(2)
-        view.getLocationOnScreen(location)
-        val quad = absoluteQuadPointsFromView(view, location)
-        val centerX = ((quad[0] + quad[2] + quad[4] + quad[6]) / 4f).roundToInt()
-        val centerY = ((quad[1] + quad[3] + quad[5] + quad[7]) / 4f).roundToInt()
-        writeDaemonConfigWithQuad(centerX, centerY, width, height, rotation, alpha, corner, editable, quad)
-    }
-
-    private fun daemonConfigJsonFromActualView(
-        view: DeadZoneView,
-        width: Int,
-        height: Int,
-        rotation: Int,
-        alpha: Int,
-        corner: Int,
-        editable: Boolean
-    ): String {
-        val location = IntArray(2)
-        view.getLocationOnScreen(location)
-        val quad = absoluteQuadPointsFromView(view, location)
-        val centerX = ((quad[0] + quad[2] + quad[4] + quad[6]) / 4f).roundToInt()
-        val centerY = ((quad[1] + quad[3] + quad[5] + quad[7]) / 4f).roundToInt()
-        return daemonConfigJsonWithQuad(centerX, centerY, width, height, rotation, alpha, corner, editable, quad)
-    }
-
-    private fun absoluteQuadPointsFromView(view: DeadZoneView, location: IntArray): FloatArray {
-        val points = view.copyLocalPoints()
-        val radians = Math.toRadians(view.rotationDegrees.toDouble())
-        val centerX = location[0] + view.width / 2f
-        val centerY = location[1] + view.height / 2f
-        val out = FloatArray(8)
-        for (i in 0 until 4) {
-            val lx = points[i * 2]
-            val ly = points[i * 2 + 1]
-            out[i * 2] = centerX + (lx * cos(radians) - ly * sin(radians)).toFloat()
-            out[i * 2 + 1] = centerY + (lx * sin(radians) + ly * cos(radians)).toFloat()
+    private fun daemonConfigJsonForRegions(regions: List<DeadZoneRegion>): String {
+        val displayWidth = currentDisplayWidth().coerceAtLeast(1)
+        val displayHeight = currentDisplayHeight().coerceAtLeast(1)
+        val first = regions.firstOrNull() ?: DeadZoneRegion(centerX = displayWidth / 2, centerY = displayHeight / 2)
+        return buildString {
+            appendLine("{")
+            appendLine("  \"enabled\": true,")
+            appendLine("  \"displayWidth\": $displayWidth,")
+            appendLine("  \"displayHeight\": $displayHeight,")
+            appendLine("  \"centerX\": ${first.centerX},")
+            appendLine("  \"centerY\": ${first.centerY},")
+            appendLine("  \"width\": ${first.width},")
+            appendLine("  \"height\": ${first.height},")
+            appendLine("  \"rotation\": ${first.rotation},")
+            appendLine("  \"zoneCount\": ${regions.size.coerceAtMost(DeadZoneRegionStore.MAX_REGIONS)},")
+            regions.take(DeadZoneRegionStore.MAX_REGIONS).forEachIndexed { index, region ->
+                appendLine("  \"z${index}Enabled\": ${region.enabled},")
+                appendLine("  \"z${index}CenterX\": ${region.centerX},")
+                appendLine("  \"z${index}CenterY\": ${region.centerY},")
+                appendLine("  \"z${index}Width\": ${region.width},")
+                appendLine("  \"z${index}Height\": ${region.height},")
+                appendLine("  \"z${index}Rotation\": ${region.rotation},")
+            }
+            appendLine("  \"editable\": ${prefs.getBoolean(KEY_EDITABLE, true)}")
+            appendLine("}")
         }
-        return out
     }
 
     private fun currentDisplayWidth(): Int {
@@ -999,12 +829,13 @@ class DeadZoneService : Service() {
         pendingDaemonConfigWrite?.let { handler.removeCallbacks(it) }
         pendingDaemonConfigWrite = null
         hideControlPanel()
-        deadZoneView?.let {
+        regionOverlays.toList().forEach { overlay ->
             try {
-                windowManager.removeView(it)
+                windowManager.removeView(overlay.view)
             } catch (_: Exception) {
             }
         }
+        regionOverlays.clear()
         deadZoneView = null
         instance = null
         stopForegroundAndOverlay()
@@ -1015,16 +846,7 @@ class DeadZoneService : Service() {
         super.onConfigurationChanged(newConfig)
         handler.post {
             restorePixelsFromNormalizedPrefsIfNeeded()
-            updateWindow(
-                prefs.getInt(KEY_CENTER_X, DEFAULT_CENTER_X),
-                prefs.getInt(KEY_CENTER_Y, DEFAULT_CENTER_Y),
-                prefs.getInt(KEY_WIDTH, DEFAULT_WIDTH),
-                prefs.getInt(KEY_HEIGHT, DEFAULT_HEIGHT),
-                prefs.getInt(KEY_ROTATION, 0),
-                prefs.getInt(KEY_ALPHA, DEFAULT_ALPHA),
-                prefs.getInt(KEY_CORNER, DEFAULT_CORNER),
-                prefs.getBoolean(KEY_EDITABLE, true)
-            )
+            reloadRegions()
             refreshDaemonConfigFromActualView()
         }
     }
