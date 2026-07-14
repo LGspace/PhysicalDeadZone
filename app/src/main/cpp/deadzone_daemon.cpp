@@ -29,7 +29,7 @@ constexpr int kDefaultScreenW = 1080;
 constexpr int kDefaultScreenH = 2400;
 constexpr const char* kDefaultStatePath = "/data/local/tmp/deadzone_state.json";
 constexpr const char* kVirtualDeviceName = "DeadZone Virtual Touchscreen";
-constexpr const char* kBackendVersion = "deadzone_daemon file-control-v5";
+constexpr const char* kBackendVersion = "deadzone_daemon file-control-v6";
 constexpr int kPendingEnableTimeoutMs = 5000;
 
 volatile sig_atomic_t g_running = 1;
@@ -71,6 +71,7 @@ struct SlotState {
     bool hasPosition = false;
     bool hasPrevious = false;
     bool splitThisGesture = false;
+    bool passthroughUntilOutside = false;
     bool blockedByDeadzone = false;
     bool endedWhileBlocked = false;
     bool virtualActive = false;
@@ -1013,6 +1014,7 @@ void updateSlotState(const input_event& ev, int* currentSlot, std::array<SlotSta
                 slot.hasPosition = false;
                 slot.hasPrevious = false;
                 slot.splitThisGesture = false;
+                slot.passthroughUntilOutside = false;
             } else {
                 slot.active = true;
                 slot.trackingId = ev.value;
@@ -1021,6 +1023,7 @@ void updateSlotState(const input_event& ev, int* currentSlot, std::array<SlotSta
                 slot.hasPosition = false;
                 slot.hasPrevious = false;
                 slot.splitThisGesture = false;
+                slot.passthroughUntilOutside = false;
                 slot.endedWhileBlocked = false;
             }
             break;
@@ -1242,18 +1245,33 @@ int main(int argc, char** argv) {
 
             for (int slotIndex = 0; slotIndex < kMaxSlots; ++slotIndex) {
                 SlotState& slot = slots[slotIndex];
-                const bool insideDeadzone = isInsideDeadzone(slot, rect, xRange, yRange, opt);
-                const bool crossedDeadzone = !insideDeadzone && !slot.blockedByDeadzone &&
+                const bool geometricInsideDeadzone = isInsideDeadzone(slot, rect, xRange, yRange, opt);
+
+                // A contact that starts inside a deadzone must behave like a normal
+                // touch. Keep it in passthrough mode until it has moved outside once;
+                // a later outside-to-inside entry in the same gesture is blockable.
+                if (slot.active && slot.hasPosition && !slot.hasPrevious && geometricInsideDeadzone) {
+                    slot.passthroughUntilOutside = true;
+                }
+                const bool passthroughThisFrame = slot.passthroughUntilOutside;
+                const bool insideDeadzone = geometricInsideDeadzone && !passthroughThisFrame;
+                const bool crossedDeadzone = !passthroughThisFrame && !insideDeadzone &&
+                                             !slot.blockedByDeadzone &&
                                              crossesDeadzone(slot, rect, xRange, yRange, opt);
+
+                if (passthroughThisFrame && !geometricInsideDeadzone) {
+                    slot.passthroughUntilOutside = false;
+                }
 
                 if (opt.verbose && slot.active && slot.hasPosition) {
                     float sx = 0.0f;
                     float sy = 0.0f;
                     mapTouchToScreen(slot, xRange, yRange, opt, rect, false, &sx, &sy);
                     fprintf(stderr,
-                            "slot=%d raw=(%d,%d) screen=(%.0f,%.0f) inside=%d blocked=%d virtual=%d crossed=%d\n",
+                            "slot=%d raw=(%d,%d) screen=(%.0f,%.0f) inside=%d passthrough=%d blocked=%d virtual=%d crossed=%d\n",
                             slotIndex, slot.x, slot.y, sx, sy,
-                            insideDeadzone ? 1 : 0,
+                            geometricInsideDeadzone ? 1 : 0,
+                            passthroughThisFrame ? 1 : 0,
                             slot.blockedByDeadzone ? 1 : 0,
                             slot.virtualActive ? 1 : 0,
                             crossedDeadzone ? 1 : 0);

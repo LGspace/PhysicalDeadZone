@@ -585,7 +585,8 @@ class MainActivity : AppCompatActivity() {
         content.addView(info("校准字段", listOf(
             "raw" to "真实触摸设备坐标",
             "screen" to "映射到屏幕后的坐标",
-            "inside/blocked" to "是否进入/正在阻断区",
+            "inside/passthrough" to "是否位于区域内/是否为区域内起按直通",
+            "blocked" to "当前 slot 是否正在阻断",
             "virtual/crossed" to "虚拟触摸是否按下/是否穿过阻断区"
         )))
         content.addView(buttons(
